@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sentinel Guard v21.8 – Last Stand Absolute (P4 code quality & maintainability)
+Sentinel Guard v22.1 – Last Stand Absolute (DDoS‑resilient proxy fixes)
 Production‑hardened, single‑file Python async anti‑DDoS layer‑7 wall.
 Works on Linux, Windows, macOS – no C‑extensions, no root.
 Requires: aiohttp >= 3.8, Python 3.9+
@@ -8,6 +8,7 @@ Requires: aiohttp >= 3.8, Python 3.9+
 
 import asyncio
 import concurrent.futures
+import gc
 import ipaddress
 import logging
 import logging.handlers
@@ -23,13 +24,11 @@ from urllib.parse import unquote, urlparse
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector, ClientError
 
 # --------------------------------------------------------------------------- #
-#  Constants (replace magic numbers)                                           #
+#  Constants                                                                    #
 # --------------------------------------------------------------------------- #
-# FastTTLCache defaults
 DEFAULT_CACHE_MAXSIZE = 100_000
 DEFAULT_CACHE_TTL = 3600
 
-# Rate limiter
 DEFAULT_RATE_LIMIT = 50.0
 DEFAULT_BURST_LIMIT = 100.0
 DEFAULT_MAX_CONN_PER_IP = 30
@@ -38,75 +37,67 @@ DEFAULT_BAN_MULT = 2.0
 DEFAULT_BAN_MAX = 3600.0
 DEFAULT_VIOLATIONS_DECAY = 3600.0
 
-# Request limits
-DEFAULT_MAX_BODY_SIZE = 1_048_576  # 1 MB
+DEFAULT_MAX_BODY_SIZE = 1_048_576
 DEFAULT_MAX_HEADER_SIZE = 8192
 DEFAULT_MAX_HEADERS = 100
 DEFAULT_MAX_URI_SIZE = 4096
 DEFAULT_MAX_TOTAL_HEADERS_SIZE = 65536
 
-# WAF
-WAF_INSPECT_SIZE = 8192          # bytes to check in body/headers
-WAF_BODY_TIMEOUT = 5.0           # seconds
-WAF_MAX_WORKERS = 64             # upper bound of thread pool workers
+WAF_INSPECT_SIZE = 8192
+WAF_BODY_TIMEOUT = 5.0
+WAF_MAX_WORKERS = 64
 
-# Endpoint shield
-DEFAULT_PER_IP_ENDPOINT_LIMIT = 30   # requests per minute per IP per endpoint
-DEFAULT_PER_IP_ENDPOINT_TTL = 60     # seconds
+DEFAULT_PER_IP_ENDPOINT_LIMIT = 30
+DEFAULT_PER_IP_ENDPOINT_TTL = 60
 
-# Global endpoint limit
+DEFAULT_GLOBAL_PER_IP_LIMIT = 100   # total requests per minute per IP
+DEFAULT_GLOBAL_PER_IP_TTL = 60
+
 DEFAULT_GLOBAL_ENDPOINT_LIMIT = 300
 
-# Health check
-HEALTH_CHECK_LIMIT = 10               # per IP per minute
+HEALTH_CHECK_LIMIT = 10
 HEALTH_CHECK_TTL = 60
 
-# Connection limits (will be recalculated from FD limit)
 MAX_SAFE_CONNS_LINUX = 15000
 MAX_SAFE_CONNS_WINDOWS = 5000
 
-# Semaphore multipliers
 WAF_SEM_MULTIPLIER = 2
 OUTBOUND_SEM_BASE = 100
 
-# Cleanup
 DEFAULT_CLEANUP_INTERVAL = 300
 
-# Circuit breaker
 DEFAULT_CB_ERROR_THRESHOLD = 5
 DEFAULT_CB_WINDOW = 60
 DEFAULT_CB_PROBE_TIMEOUT = 30
 
-# Forwarding
 XFF_MAX_LENGTH = 2048
 XFF_MAX_IPS = 50
 STREAM_CHUNK_SIZE = 8192
 BACKEND_TIMEOUT = 30.0
 
-# HTTP server
 KEEPALIVE_TIMEOUT = 15
 SLOW_REQUEST_TIMEOUT = 10
 
-# Logging
 DEFAULT_LOG_QUEUE_MAXSIZE = 5000
 
-# Ban stores
 BAN_STORE_MAXSIZE = 500_000
-BAN_STORE_TTL = 86400  # 24 hours
-STATE_STORE_MAXSIZE = 100_000
-STATE_STORE_TTL = 3600  # 1 hour
+BAN_STORE_TTL = 86400
+STATE_STORE_MAXSIZE = 50_000   # Reduced for DDoS resilience
+STATE_STORE_TTL = 3600
 
-# Rate limit key cache
-KEY_CACHE_MAXSIZE = 50_000
+KEY_CACHE_MAXSIZE = 20_000     # Reduced for DDoS resilience
 KEY_CACHE_TTL = 600
 
-# IP object cache
 IP_OBJ_CACHE_MAXSIZE = 100_000
 IP_OBJ_CACHE_TTL = 3600
 
-# Classification cache
 IP_CLASS_CACHE_MAXSIZE = 100_000
 IP_CLASS_CACHE_TTL = 3600
+
+# Unique query tracking
+UNIQUE_QUERY_CACHE_MAXSIZE = 50_000
+UNIQUE_QUERY_CACHE_TTL = 300   # 5 minutes
+UNIQUE_QUERY_THRESHOLD = 20    # ban IP if more than 20 unique query strings in 5 min
 
 # --------------------------------------------------------------------------- #
 #  Raise file descriptor limit (Linux only)                                    #
@@ -122,10 +113,6 @@ if sys.platform != "win32":
 #  FAST LRU TTL CACHE                                                         #
 # --------------------------------------------------------------------------- #
 class FastTTLCache:
-    """A fast, LRU‑based TTL cache using OrderedDict.
-
-    Provides O(1) get/set/contains with lazy expiration.
-    """
     __slots__ = ('_data', '_maxsize', '_ttl')
 
     def __init__(self, maxsize: int = DEFAULT_CACHE_MAXSIZE, ttl: float = DEFAULT_CACHE_TTL):
@@ -134,22 +121,20 @@ class FastTTLCache:
         self._ttl = ttl
 
     def get(self, key: str):
-        """Return value if key exists and not expired, else None."""
         item = self._data.get(key)
         if not item:
             return None
         if item[1] < time.monotonic():
             del self._data[key]
             return None
-        self._data.move_to_end(key)   # LRU promotion
+        self._data.move_to_end(key)
         return item[0]
 
     def __setitem__(self, key: str, value):
-        """Insert or update a key with current timestamp + TTL."""
         if key in self._data:
             self._data.move_to_end(key)
         elif len(self._data) >= self._maxsize:
-            self._data.popitem(last=False)   # evict oldest
+            self._data.popitem(last=False)
         self._data[key] = (value, time.monotonic() + self._ttl)
 
     def __getitem__(self, key: str):
@@ -159,7 +144,6 @@ class FastTTLCache:
         return val
 
     def __contains__(self, key: str):
-        """Non‑mutating membership test."""
         item = self._data.get(key)
         if not item:
             return False
@@ -169,7 +153,6 @@ class FastTTLCache:
 #  CONFIGURATION (safe environment parsing, validated ranges)                 #
 # --------------------------------------------------------------------------- #
 class Config:
-    """Application configuration loaded from environment variables."""
 
     @staticmethod
     def _safe_int(val: str, default: int, min_val: int = None, max_val: int = None) -> int:
@@ -273,6 +256,7 @@ class Config:
         self.audit_log_file = os.getenv("AUDIT_LOG_FILE", "sentinel_audit.log")
 
         self.global_endpoint_limit = self._safe_int(os.getenv("GLOBAL_ENDPOINT_LIMIT", ""), DEFAULT_GLOBAL_ENDPOINT_LIMIT, 0)
+        self.global_per_ip_limit = self._safe_int(os.getenv("GLOBAL_PER_IP_LIMIT", ""), DEFAULT_GLOBAL_PER_IP_LIMIT, 1)
         self.server_header = os.getenv("SERVER_HEADER", "Sentinel-Guard")
         self.shutdown_timeout = self._safe_float(os.getenv("SHUTDOWN_TIMEOUT", ""), 30.0, 1.0)
 
@@ -311,20 +295,17 @@ BLOCK_HEADERS = {'Connection': 'close', 'Cache-Control': 'no-store'}
 #  LOGGING (non‑blocking handlers, separate audit log)                        #
 # --------------------------------------------------------------------------- #
 class NonBlockingQueueHandler(logging.handlers.QueueHandler):
-    """Queue handler that drops log records when queue is full."""
     def emit(self, record):
         try:
             self.enqueue(record)
         except queue.Full:
             pass
 
-# Main logger
 queue_handler = NonBlockingQueueHandler(log_queue)
 logger = logging.getLogger("Sentinel")
 logger.setLevel(CFG.log_level)
 logger.addHandler(queue_handler)
 
-# Security audit logger (separate file, always WARNING)
 audit_queue_handler = NonBlockingQueueHandler(audit_log_queue)
 audit_logger = logging.getLogger("Sentinel.Audit")
 audit_logger.setLevel("WARNING")
@@ -363,7 +344,6 @@ _XSS_PATTERNS = [
 ]
 
 def _decode_aggressive(data: str) -> str:
-    """Multi‑layer URL decode + UTF‑16/32 detection."""
     cleaned = data
     for _ in range(5):
         new_cleaned = unquote(cleaned)
@@ -384,7 +364,6 @@ def _decode_aggressive(data: str) -> str:
     return cleaned
 
 def waf_check(data: str) -> Optional[str]:
-    """Check data for SQLi or XSS patterns. Returns 'SQLi', 'XSS', 'ERROR', or None."""
     if not CFG.enable_waf or not data:
         return None
 
@@ -407,7 +386,6 @@ def waf_check(data: str) -> Optional[str]:
     return None
 
 async def async_waf_check(data: str) -> Optional[str]:
-    """Run waf_check in thread pool to avoid blocking the event loop."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(waf_executor, waf_check, data)
 
@@ -415,7 +393,6 @@ async def async_waf_check(data: str) -> Optional[str]:
 #  RATE LIMITER & IP STATE (per‑key locks, subnet‑aware)                      #
 # --------------------------------------------------------------------------- #
 class IPState:
-    """Tracks token bucket and violation state for a single IP/subnet."""
     __slots__ = ("tokens","last_time","violations","last_violation_time","active_conns")
     def __init__(self, burst: float):
         self.tokens = burst
@@ -425,7 +402,6 @@ class IPState:
         self.active_conns = 0
 
 class RateLimiter:
-    """Token‑bucket rate limiter with automatic banning and IPv4/IPv6 subnet grouping."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -435,7 +411,6 @@ class RateLimiter:
         self._key_cache = FastTTLCache(maxsize=KEY_CACHE_MAXSIZE, ttl=KEY_CACHE_TTL)
 
     def _get_rate_limit_key(self, ip_str: str) -> str:
-        """Map IP to a subnet‑based key to prevent IP rotation."""
         key = self._key_cache.get(ip_str)
         if key is not None:
             return key
@@ -467,7 +442,6 @@ class RateLimiter:
         return state
 
     async def check_and_acquire(self, ip: str) -> Tuple[bool, float, str]:
-        """Atomically check ban, connection limit, and token acquisition."""
         key = self._get_rate_limit_key(ip)
         lock = self._get_lock(key)
         async with lock:
@@ -507,7 +481,6 @@ class RateLimiter:
             s.active_conns -= 1
 
     def force_ban(self, ip: str, duration: float = None):
-        """Immediately ban an IP, regardless of current state."""
         key = self._get_rate_limit_key(ip)
         if duration is None:
             duration = self.cfg.ban_max
@@ -525,7 +498,6 @@ class RateLimiter:
         return ban_until and ban_until > time.monotonic()
 
     async def cleanup_expired_bans(self):
-        """Remove stale entries from all stores."""
         now = time.monotonic()
         for store in (self._ban_store, self._store, self._key_cache):
             expired_keys = [k for k, (_, exp) in store._data.items() if exp < now]
@@ -536,11 +508,15 @@ class RateLimiter:
                     pass
             await asyncio.sleep(0)
 
+        active_keys = set(self._store._data.keys())
+        dead_locks = [k for k in self._locks if k not in active_keys]
+        for k in dead_locks:
+            del self._locks[k]
+
 # --------------------------------------------------------------------------- #
 #  CIRCUIT BREAKER (with lock for HALF_OPEN transition)                       #
 # --------------------------------------------------------------------------- #
 class CircuitBreaker:
-    """Circuit breaker to prevent cascading failures to backend."""
 
     def __init__(self, err_thr: int, window: float, probe_timeout: float):
         self.err_thr = err_thr
@@ -577,7 +553,6 @@ class CircuitBreaker:
             logger.info("Circuit breaker CLOSED (probe succeeded)")
 
     async def allow(self) -> bool:
-        """Return True if a request may proceed to the backend."""
         now = time.monotonic()
         if self._state == "CLOSED":
             return True
@@ -601,10 +576,9 @@ class CircuitBreaker:
             return False
 
 # --------------------------------------------------------------------------- #
-#  SENTINEL APP (main reverse proxy application)                              #
+#  SENTINEL APP (global per‑IP limit, unique query detection)                 #
 # --------------------------------------------------------------------------- #
 class SentinelApp:
-    """Core reverse proxy with integrated WAF, rate limiter, and circuit breaker."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -615,6 +589,10 @@ class SentinelApp:
         self.ip_obj_cache = FastTTLCache(maxsize=IP_OBJ_CACHE_MAXSIZE, ttl=IP_OBJ_CACHE_TTL)
         self.ip_class_cache = FastTTLCache(maxsize=IP_CLASS_CACHE_MAXSIZE, ttl=IP_CLASS_CACHE_TTL)
         self.per_ip_endpoint_cache = FastTTLCache(maxsize=STATE_STORE_MAXSIZE, ttl=DEFAULT_PER_IP_ENDPOINT_TTL)
+        # Global per-IP request counter
+        self.global_per_ip_cache = FastTTLCache(maxsize=STATE_STORE_MAXSIZE, ttl=DEFAULT_GLOBAL_PER_IP_TTL)
+        # Unique query string tracker
+        self.unique_query_cache = FastTTLCache(maxsize=UNIQUE_QUERY_CACHE_MAXSIZE, ttl=UNIQUE_QUERY_CACHE_TTL)
         parsed_backend = urlparse(cfg.backend_url)
         self.backend_host = parsed_backend.hostname or "localhost"
         if parsed_backend.port:
@@ -622,7 +600,6 @@ class SentinelApp:
         self._shutdown_event = asyncio.Event()
 
     async def startup(self, app: web.Application):
-        """Initialize resources and start background tasks."""
         global waf_executor, listener, audit_listener
 
         try:
@@ -657,11 +634,11 @@ class SentinelApp:
 
         connector = TCPConnector(limit=self.cfg.backend_pool_size, ttl_dns_cache=300)
         timeout = ClientTimeout(total=self.cfg.backend_timeout, connect=5, sock_read=10, sock_connect=5)
-        self.session = ClientSession(connector=connector, timeout=timeout, auto_decompress=False)
+        # auto_decompress=True prevents amplification caused by raw gzip forwarding
+        self.session = ClientSession(connector=connector, timeout=timeout, auto_decompress=True)
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     async def shutdown(self, app: web.Application):
-        """Gracefully stop the service: wait for in‑flight requests, then clean up."""
         self._shutdown_event.set()
 
         logger.info("Shutting down – waiting for in-flight requests...")
@@ -696,17 +673,16 @@ class SentinelApp:
             logger.info("WAF executor shut down gracefully")
 
     async def _cleanup_loop(self):
-        """Periodically purge expired cache entries."""
         while True:
             await asyncio.sleep(self.cfg.cleanup_interval)
             await self.rate_limiter.cleanup_expired_bans()
+            gc.collect()
 
     # ------------------------------------------------------------------- #
     #  IP EXTRACTION – Cloudflare‑aware, IPv4‑mapped IPv6 handling        #
     # ------------------------------------------------------------------- #
     @staticmethod
     def _normalize_ip(ip_str: str) -> str:
-        """Convert IPv4‑mapped IPv6 addresses to plain IPv4."""
         try:
             ip = ipaddress.ip_address(ip_str)
             if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
@@ -725,7 +701,6 @@ class SentinelApp:
 
     @staticmethod
     def get_real_ip(request: web.Request) -> str:
-        """Extract the real client IP, honoring Cloudflare and X-Forwarded-For."""
         remote = request.remote or "0.0.0.0"
         normalized = SentinelApp._normalize_ip(remote)
         if not SentinelApp._ip_matches_networks(normalized, CFG.trusted_proxies):
@@ -749,7 +724,6 @@ class SentinelApp:
 
     @staticmethod
     def filter_hop(headers: Dict):
-        """Remove hop‑by‑hop headers before forwarding."""
         hop_lower = {'transfer-encoding', 'connection', 'keep-alive', 'proxy-authenticate',
                      'proxy-authorization', 'te', 'trailers', 'upgrade', 'content-length'}
         conn_vals = headers.getall('Connection', [])
@@ -761,7 +735,6 @@ class SentinelApp:
                 del headers[key]
 
     def _classify_ip(self, ip_str: str, ip_obj) -> str:
-        """Classify IP as blacklist, whitelist, or normal (with caching)."""
         if ip_str in self.ip_class_cache:
             return self.ip_class_cache[ip_str]
         if any(ip_obj in net for net in CFG.blacklist_ips):
@@ -774,7 +747,6 @@ class SentinelApp:
         return cls
 
     async def _blackhole(self, request: web.Request, reason: str = "Banned") -> web.Response:
-        """Immediately drop the connection (TCP RST) unless behind a trusted proxy."""
         remote = request.remote or "0.0.0.0"
         is_trusted_proxy = self._ip_matches_networks(self._normalize_ip(remote), CFG.trusted_proxies)
         if not is_trusted_proxy and request.transport and not request.transport.is_closing():
@@ -785,7 +757,6 @@ class SentinelApp:
         return web.Response(status=444)
 
     async def handler(self, request: web.Request) -> web.Response:
-        """Main request handler: concurrency limit, routing, and timeout."""
         if self._shutdown_event.is_set():
             if request.transport and not request.transport.is_closing():
                 request.transport.abort()
@@ -813,7 +784,6 @@ class SentinelApp:
                 return await self._blackhole(request, "Internal Error")
 
     async def _process_request(self, request: web.Request) -> web.Response:
-        """Core request processing: validation, rate limiting, WAF, forwarding."""
         ip = self.get_real_ip(request)
 
         if request.path == "/health":
@@ -838,6 +808,24 @@ class SentinelApp:
         for name, value in request.headers.items():
             if len(name) > 256 or len(value) > CFG.max_header_size:
                 return web.Response(status=400, text="Header Too Large", headers=BLOCK_HEADERS)
+
+        # Global per-IP limit (total requests per minute, regardless of endpoint)
+        global_ip_key = f"global:{ip}"
+        global_ip_count = self.global_per_ip_cache.get(global_ip_key) or 0
+        if global_ip_count > CFG.global_per_ip_limit:
+            return await self._blackhole(request, "Global IP Limit")
+        self.global_per_ip_cache[global_ip_key] = global_ip_count + 1
+
+        # Unique query string tracking (detect cache-busting / scraping patterns)
+        if request.query_string:
+            uq_key = f"uq:{ip}"
+            recent_queries = self.unique_query_cache.get(uq_key) or set()
+            recent_queries.add(request.query_string)
+            if len(recent_queries) > UNIQUE_QUERY_THRESHOLD:
+                self.rate_limiter.force_ban(ip)
+                audit_logger.warning("SCRAPER_PATTERN %s unique_queries=%d", ip, len(recent_queries))
+                return await self._blackhole(request, "Scraper Pattern")
+            self.unique_query_cache[uq_key] = recent_queries
 
         endpoint_key = f"{ip}:{request.method}:{request.path}"
         count_entry = self.per_ip_endpoint_cache.get(endpoint_key)
@@ -887,7 +875,6 @@ class SentinelApp:
             self.rate_limiter.dec_conn(ip)
 
     async def _filter(self, request: web.Request, ip: str, skip_waf: bool = False) -> Tuple[bool, Optional[web.Response], Optional[bytes]]:
-        """Run method, UA, WAF checks, and optionally read body for WAF inspection."""
         if request.method not in CFG.allowed_methods:
             return False, web.Response(status=405, headers=BLOCK_HEADERS), None
 
@@ -948,7 +935,6 @@ class SentinelApp:
         return True, None, body_chunk
 
     async def _forward(self, request: web.Request, ip: str, body_chunk: Optional[bytes]) -> web.Response:
-        """Forward the request to the backend and stream the response back."""
         path = request.path_qs
         if CFG.backend_url.endswith('/') and path.startswith('/'):
             url = CFG.backend_url + path[1:]
@@ -978,42 +964,42 @@ class SentinelApp:
 
         async with OUTBOUND_REQ_SEM:
             try:
-                resp = await self.session.request(
+                async with self.session.request(
                     request.method, url, headers=headers,
                     data=body_chunk, allow_redirects=False,
                     ssl=CFG.verify_ssl
-                )
-                if resp.status >= 500:
-                    self.cb.record_error()
-                    logger.warning("Backend %d for %s", resp.status, ip)
-                else:
-                    self.cb.record_success()
+                ) as resp:
+                    if resp.status >= 500:
+                        self.cb.record_error()
+                        logger.warning("Backend %d for %s", resp.status, ip)
+                    else:
+                        self.cb.record_success()
 
-                backend_headers = resp.headers.copy()
-                self.filter_hop(backend_headers)
-                backend_headers.pop('Server', None)
-                backend_headers.pop('X-Powered-By', None)
-                if CFG.server_header:
-                    backend_headers['Server'] = CFG.server_header
+                    backend_headers = resp.headers.copy()
+                    self.filter_hop(backend_headers)
+                    backend_headers.pop('Server', None)
+                    backend_headers.pop('X-Powered-By', None)
+                    if CFG.server_header:
+                        backend_headers['Server'] = CFG.server_header
 
-                client_resp = web.StreamResponse(status=resp.status, headers=backend_headers)
-                await client_resp.prepare(request)
+                    client_resp = web.StreamResponse(status=resp.status, headers=backend_headers)
+                    await client_resp.prepare(request)
 
-                try:
-                    async def stream_response():
-                        async for chunk in resp.content.iter_chunked(STREAM_CHUNK_SIZE):
-                            await client_resp.write(chunk)
-                        await client_resp.write_eof()
+                    try:
+                        async def stream_response():
+                            async for chunk in resp.content.iter_chunked(STREAM_CHUNK_SIZE):
+                                await client_resp.write(chunk)
+                            await client_resp.write_eof()
 
-                    await asyncio.wait_for(stream_response(), timeout=CFG.backend_timeout)
-                except (asyncio.TimeoutError, ConnectionResetError, ConnectionAbortedError,
-                        BrokenPipeError, asyncio.IncompleteReadError, ClientError):
-                    logger.debug("Client connection interrupted: %s", ip)
-                    if request.transport and not request.transport.is_closing():
-                        request.transport.abort()
+                        await asyncio.wait_for(stream_response(), timeout=CFG.backend_timeout)
+                    except (asyncio.TimeoutError, ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError, asyncio.IncompleteReadError, ClientError):
+                        logger.debug("Client connection interrupted: %s", ip)
+                        if request.transport and not request.transport.is_closing():
+                            request.transport.abort()
+                        return client_resp
+
                     return client_resp
-
-                return client_resp
             except ClientError as e:
                 self.cb.record_error()
                 logger.error("Backend connection error for %s: %s", ip, e)
@@ -1026,7 +1012,6 @@ class SentinelApp:
 #  APPLICATION FACTORY                                                        #
 # --------------------------------------------------------------------------- #
 def create_app():
-    """Build and return the aiohttp Application instance."""
     sentinel = SentinelApp(CFG)
     app = web.Application(client_max_size=CFG.max_body_size)
     app.on_startup.append(sentinel.startup)
