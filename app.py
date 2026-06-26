@@ -1,6 +1,7 @@
+```python
 #!/usr/bin/env python3
 """
-Sentinel Guard v22.1 – Last Stand Absolute (DDoS‑resilient proxy fixes)
+Sentinel Guard v22.3 – Last Stand Absolute (CPU/bw anti‑amplification)
 Production‑hardened, single‑file Python async anti‑DDoS layer‑7 wall.
 Works on Linux, Windows, macOS – no C‑extensions, no root.
 Requires: aiohttp >= 3.8, Python 3.9+
@@ -50,7 +51,7 @@ WAF_MAX_WORKERS = 64
 DEFAULT_PER_IP_ENDPOINT_LIMIT = 30
 DEFAULT_PER_IP_ENDPOINT_TTL = 60
 
-DEFAULT_GLOBAL_PER_IP_LIMIT = 100   # total requests per minute per IP
+DEFAULT_GLOBAL_PER_IP_LIMIT = 100
 DEFAULT_GLOBAL_PER_IP_TTL = 60
 
 DEFAULT_GLOBAL_ENDPOINT_LIMIT = 300
@@ -82,10 +83,10 @@ DEFAULT_LOG_QUEUE_MAXSIZE = 5000
 
 BAN_STORE_MAXSIZE = 500_000
 BAN_STORE_TTL = 86400
-STATE_STORE_MAXSIZE = 50_000   # Reduced for DDoS resilience
+STATE_STORE_MAXSIZE = 50_000
 STATE_STORE_TTL = 3600
 
-KEY_CACHE_MAXSIZE = 20_000     # Reduced for DDoS resilience
+KEY_CACHE_MAXSIZE = 20_000
 KEY_CACHE_TTL = 600
 
 IP_OBJ_CACHE_MAXSIZE = 100_000
@@ -94,10 +95,11 @@ IP_OBJ_CACHE_TTL = 3600
 IP_CLASS_CACHE_MAXSIZE = 100_000
 IP_CLASS_CACHE_TTL = 3600
 
-# Unique query tracking
 UNIQUE_QUERY_CACHE_MAXSIZE = 50_000
-UNIQUE_QUERY_CACHE_TTL = 300   # 5 minutes
-UNIQUE_QUERY_THRESHOLD = 20    # ban IP if more than 20 unique query strings in 5 min
+UNIQUE_QUERY_CACHE_TTL = 300
+UNIQUE_QUERY_THRESHOLD = 20
+
+SHARD_LOCK_COUNT = 1024
 
 # --------------------------------------------------------------------------- #
 #  Raise file descriptor limit (Linux only)                                    #
@@ -390,7 +392,7 @@ async def async_waf_check(data: str) -> Optional[str]:
     return await loop.run_in_executor(waf_executor, waf_check, data)
 
 # --------------------------------------------------------------------------- #
-#  RATE LIMITER & IP STATE (per‑key locks, subnet‑aware)                      #
+#  RATE LIMITER & IP STATE (sharded locks, no O(N) cleanup)                   #
 # --------------------------------------------------------------------------- #
 class IPState:
     __slots__ = ("tokens","last_time","violations","last_violation_time","active_conns")
@@ -407,8 +409,9 @@ class RateLimiter:
         self.cfg = cfg
         self._store = FastTTLCache(maxsize=STATE_STORE_MAXSIZE, ttl=STATE_STORE_TTL)
         self._ban_store = FastTTLCache(maxsize=BAN_STORE_MAXSIZE, ttl=BAN_STORE_TTL)
-        self._locks: Dict[str, asyncio.Lock] = {}
         self._key_cache = FastTTLCache(maxsize=KEY_CACHE_MAXSIZE, ttl=KEY_CACHE_TTL)
+        # Sharded locks to avoid event‑loop starvation and memory leaks
+        self._locks_pool = [asyncio.Lock() for _ in range(SHARD_LOCK_COUNT)]
 
     def _get_rate_limit_key(self, ip_str: str) -> str:
         key = self._key_cache.get(ip_str)
@@ -427,12 +430,8 @@ class RateLimiter:
         self._key_cache[ip_str] = key
         return key
 
-    def _get_lock(self, key: str) -> asyncio.Lock:
-        lock = self._locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[key] = lock
-        return lock
+    def _get_shard_lock(self, key: str) -> asyncio.Lock:
+        return self._locks_pool[hash(key) % SHARD_LOCK_COUNT]
 
     def _get(self, key: str) -> IPState:
         state = self._store.get(key)
@@ -443,7 +442,7 @@ class RateLimiter:
 
     async def check_and_acquire(self, ip: str) -> Tuple[bool, float, str]:
         key = self._get_rate_limit_key(ip)
-        lock = self._get_lock(key)
+        lock = self._get_shard_lock(key)
         async with lock:
             now = time.monotonic()
             ban_until = self._ban_store.get(key)
@@ -496,22 +495,6 @@ class RateLimiter:
         key = self._get_rate_limit_key(ip)
         ban_until = self._ban_store.get(key)
         return ban_until and ban_until > time.monotonic()
-
-    async def cleanup_expired_bans(self):
-        now = time.monotonic()
-        for store in (self._ban_store, self._store, self._key_cache):
-            expired_keys = [k for k, (_, exp) in store._data.items() if exp < now]
-            for k in expired_keys:
-                try:
-                    del store._data[k]
-                except KeyError:
-                    pass
-            await asyncio.sleep(0)
-
-        active_keys = set(self._store._data.keys())
-        dead_locks = [k for k in self._locks if k not in active_keys]
-        for k in dead_locks:
-            del self._locks[k]
 
 # --------------------------------------------------------------------------- #
 #  CIRCUIT BREAKER (with lock for HALF_OPEN transition)                       #
@@ -576,7 +559,7 @@ class CircuitBreaker:
             return False
 
 # --------------------------------------------------------------------------- #
-#  SENTINEL APP (global per‑IP limit, unique query detection)                 #
+#  SENTINEL APP (no full body buffering, executor‑backed GC, binary skip)    #
 # --------------------------------------------------------------------------- #
 class SentinelApp:
 
@@ -589,9 +572,7 @@ class SentinelApp:
         self.ip_obj_cache = FastTTLCache(maxsize=IP_OBJ_CACHE_MAXSIZE, ttl=IP_OBJ_CACHE_TTL)
         self.ip_class_cache = FastTTLCache(maxsize=IP_CLASS_CACHE_MAXSIZE, ttl=IP_CLASS_CACHE_TTL)
         self.per_ip_endpoint_cache = FastTTLCache(maxsize=STATE_STORE_MAXSIZE, ttl=DEFAULT_PER_IP_ENDPOINT_TTL)
-        # Global per-IP request counter
         self.global_per_ip_cache = FastTTLCache(maxsize=STATE_STORE_MAXSIZE, ttl=DEFAULT_GLOBAL_PER_IP_TTL)
-        # Unique query string tracker
         self.unique_query_cache = FastTTLCache(maxsize=UNIQUE_QUERY_CACHE_MAXSIZE, ttl=UNIQUE_QUERY_CACHE_TTL)
         parsed_backend = urlparse(cfg.backend_url)
         self.backend_host = parsed_backend.hostname or "localhost"
@@ -634,8 +615,8 @@ class SentinelApp:
 
         connector = TCPConnector(limit=self.cfg.backend_pool_size, ttl_dns_cache=300)
         timeout = ClientTimeout(total=self.cfg.backend_timeout, connect=5, sock_read=10, sock_connect=5)
-        # auto_decompress=True prevents amplification caused by raw gzip forwarding
-        self.session = ClientSession(connector=connector, timeout=timeout, auto_decompress=True)
+        # Keep auto_decompress=False to avoid CPU amplification
+        self.session = ClientSession(connector=connector, timeout=timeout, auto_decompress=False)
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     async def shutdown(self, app: web.Application):
@@ -675,8 +656,9 @@ class SentinelApp:
     async def _cleanup_loop(self):
         while True:
             await asyncio.sleep(self.cfg.cleanup_interval)
-            await self.rate_limiter.cleanup_expired_bans()
-            gc.collect()
+            # Run garbage collection in executor to avoid blocking the event loop
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, gc.collect)
 
     # ------------------------------------------------------------------- #
     #  IP EXTRACTION – Cloudflare‑aware, IPv4‑mapped IPv6 handling        #
@@ -809,14 +791,12 @@ class SentinelApp:
             if len(name) > 256 or len(value) > CFG.max_header_size:
                 return web.Response(status=400, text="Header Too Large", headers=BLOCK_HEADERS)
 
-        # Global per-IP limit (total requests per minute, regardless of endpoint)
         global_ip_key = f"global:{ip}"
         global_ip_count = self.global_per_ip_cache.get(global_ip_key) or 0
         if global_ip_count > CFG.global_per_ip_limit:
             return await self._blackhole(request, "Global IP Limit")
         self.global_per_ip_cache[global_ip_key] = global_ip_count + 1
 
-        # Unique query string tracking (detect cache-busting / scraping patterns)
         if request.query_string:
             uq_key = f"uq:{ip}"
             recent_queries = self.unique_query_cache.get(uq_key) or set()
@@ -874,6 +854,18 @@ class SentinelApp:
         finally:
             self.rate_limiter.dec_conn(ip)
 
+    @staticmethod
+    def _is_text_content(content_type: Optional[str]) -> bool:
+        """Return True if the Content-Type should be scanned by WAF."""
+        if not content_type:
+            return False
+        ct = content_type.lower().split(';')[0].strip()
+        if ct.startswith('text/'):
+            return True
+        if ct in ('application/json', 'application/xml', 'application/x-www-form-urlencoded'):
+            return True
+        return False
+
     async def _filter(self, request: web.Request, ip: str, skip_waf: bool = False) -> Tuple[bool, Optional[web.Response], Optional[bytes]]:
         if request.method not in CFG.allowed_methods:
             return False, web.Response(status=405, headers=BLOCK_HEADERS), None
@@ -904,33 +896,39 @@ class SentinelApp:
 
         body_chunk = None
         if request.can_read_body and request.method in ("POST", "PUT", "PATCH", "DELETE"):
-            if WAF_SEM.locked():
-                logger.warning("WAF queue full – dropping %s", ip)
-                return False, await self._blackhole(request, "WAF Overloaded"), None
+            # Only inspect body for text-based content (skip binary to prevent CPU exhaustion)
+            if CFG.enable_waf and not skip_waf and self._is_text_content(request.content_type):
+                if WAF_SEM.locked():
+                    logger.warning("WAF queue full – dropping %s", ip)
+                    return False, await self._blackhole(request, "WAF Overloaded"), None
 
-            async with WAF_SEM:
-                try:
-                    body_chunk = await asyncio.wait_for(request.read(), timeout=CFG.waf_body_timeout)
-                except web.HTTPRequestEntityTooLarge:
-                    self.rate_limiter.force_ban(ip, self.cfg.ban_max)
-                    audit_logger.warning("PAYLOAD_TOO_LARGE %s", ip)
-                    return False, web.Response(status=413, text="Payload Too Large", headers=BLOCK_HEADERS), None
-                except (asyncio.TimeoutError, TimeoutError):
-                    return False, await self._blackhole(request, "Body Read Timeout"), None
-                except Exception as e:
-                    logger.error("Body read error: %s", e)
-                    return False, web.Response(status=400, headers=BLOCK_HEADERS), None
+                async with WAF_SEM:
+                    try:
+                        body_chunk = await asyncio.wait_for(
+                            request.content.read(WAF_INSPECT_SIZE),
+                            timeout=CFG.waf_body_timeout
+                        )
+                    except web.HTTPRequestEntityTooLarge:
+                        self.rate_limiter.force_ban(ip, self.cfg.ban_max)
+                        audit_logger.warning("PAYLOAD_TOO_LARGE %s", ip)
+                        return False, web.Response(status=413, text="Payload Too Large", headers=BLOCK_HEADERS), None
+                    except (asyncio.TimeoutError, TimeoutError):
+                        return False, await self._blackhole(request, "Body Read Timeout"), None
+                    except Exception as e:
+                        logger.error("Body read error: %s", e)
+                        return False, web.Response(status=400, headers=BLOCK_HEADERS), None
 
-                if CFG.enable_waf and body_chunk:
-                    text = body_chunk[:WAF_INSPECT_SIZE].decode('utf-8', 'ignore')
-                    waf_result = await async_waf_check(text)
-                    if waf_result == "ERROR":
-                        self.rate_limiter.force_ban(ip)
-                        audit_logger.warning("WAF_ERROR_BODY %s", ip)
-                        return False, web.Response(status=403, text="WAF Error", headers=BLOCK_HEADERS), None
-                    elif waf_result:
-                        audit_logger.warning("WAF_HIT_BODY %s %s %s", ip, waf_result, request.path)
-                        return False, web.Response(status=403, text="WAF Blocked", headers=BLOCK_HEADERS), None
+                    if body_chunk:
+                        text = body_chunk[:WAF_INSPECT_SIZE].decode('utf-8', 'ignore')
+                        waf_result = await async_waf_check(text)
+                        if waf_result == "ERROR":
+                            self.rate_limiter.force_ban(ip)
+                            audit_logger.warning("WAF_ERROR_BODY %s", ip)
+                            return False, web.Response(status=403, text="WAF Error", headers=BLOCK_HEADERS), None
+                        elif waf_result:
+                            audit_logger.warning("WAF_HIT_BODY %s %s %s", ip, waf_result, request.path)
+                            return False, web.Response(status=403, text="WAF Blocked", headers=BLOCK_HEADERS), None
+            # For binary or non-WAF body, body_chunk stays None (streamed directly later)
 
         return True, None, body_chunk
 
@@ -966,7 +964,8 @@ class SentinelApp:
             try:
                 async with self.session.request(
                     request.method, url, headers=headers,
-                    data=body_chunk, allow_redirects=False,
+                    data=self._make_body_stream(body_chunk, request),
+                    allow_redirects=False,
                     ssl=CFG.verify_ssl
                 ) as resp:
                     if resp.status >= 500:
@@ -1008,6 +1007,16 @@ class SentinelApp:
                 self.cb.record_error()
                 return web.Response(status=504, text="Gateway Timeout", headers=BLOCK_HEADERS)
 
+    @staticmethod
+    def _make_body_stream(body_chunk: Optional[bytes], request: web.Request):
+        """Yield the prefix chunk (already read for WAF) and then stream the rest."""
+        async def _stream():
+            if body_chunk:
+                yield body_chunk
+            async for chunk in request.content.iter_chunked(STREAM_CHUNK_SIZE):
+                yield chunk
+        return _stream()
+
 # --------------------------------------------------------------------------- #
 #  APPLICATION FACTORY                                                        #
 # --------------------------------------------------------------------------- #
@@ -1026,3 +1035,4 @@ if __name__ == "__main__":
     }
     web.run_app(create_app(), host=CFG.listen_host, port=CFG.listen_port,
                 handle_signals=True, handler_args=handler_args)
+```
