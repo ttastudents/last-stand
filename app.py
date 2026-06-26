@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Sentinel Guard v17.0 – Immortal Bastion (Safe Forwarding)
+Sentinel Guard v19.1 – Immortal Bastion (Fixed subscriptable cache)
 Production‑hardened, single‑file Python async anti‑DDoS layer‑7 wall.
 Works on Linux, Windows, macOS – no C‑extensions, no root.
-Requires: aiohttp, cachetools
+Requires: aiohttp
 """
 
 import asyncio
@@ -16,12 +16,44 @@ import queue
 import re
 import sys
 import time
-from collections import deque
+from collections import deque, OrderedDict
 from typing import Dict, Optional, Set, Tuple
 from urllib.parse import unquote
 
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector, ClientError
-from cachetools import TTLCache
+
+# --------------------------------------------------------------------------- #
+#  FAST FIFO TTL CACHE (subscriptable)                                        #
+# --------------------------------------------------------------------------- #
+class FastTTLCache:
+    __slots__ = ('_data', '_maxsize', '_ttl')
+    def __init__(self, maxsize: int, ttl: float):
+        self._data = OrderedDict()
+        self._maxsize = maxsize
+        self._ttl = ttl
+
+    def get(self, key: str):
+        item = self._data.get(key)
+        if not item:
+            return None
+        if item[1] < time.monotonic():
+            del self._data[key]
+            return None
+        return item[0]
+
+    def __setitem__(self, key: str, value):
+        if len(self._data) >= self._maxsize:
+            self._data.popitem(last=False)  # FIFO eviction
+        self._data[key] = (value, time.monotonic() + self._ttl)
+
+    def __getitem__(self, key: str):
+        val = self.get(key)
+        if val is None:
+            raise KeyError(key)
+        return val
+
+    def __contains__(self, key: str):
+        return self.get(key) is not None
 
 # --------------------------------------------------------------------------- #
 #  CONFIGURATION (safe environment parsing)                                   #
@@ -69,7 +101,8 @@ class Config:
         self.violations_decay = self._safe_float(os.getenv("VIOLATIONS_DECAY", ""), 3600.0)
 
         self.trusted_proxies = self._parse_networks(os.getenv("TRUSTED_PROXIES", ""))
-        self.whitelist_ips   = self._parse_networks(os.getenv("WHITELIST", "127.0.0.1,::1"))
+        # Whitelist empty by default – localhost no longer exempt from security checks
+        self.whitelist_ips   = self._parse_networks(os.getenv("WHITELIST", ""))
         self.blacklist_ips   = self._parse_networks(os.getenv("BLACKLIST", ""))
 
         self.allowed_methods = set(m.strip().upper() for m in os.getenv("ALLOWED_METHODS", "GET,POST,HEAD,PUT,DELETE").split(",") if m.strip())
@@ -118,6 +151,8 @@ INBOUND_CONN_SEM = asyncio.Semaphore(MAX_SAFE_CONNS)
 WAF_SEM = asyncio.Semaphore(CFG.backend_pool_size * 2)
 OUTBOUND_REQ_SEM = asyncio.Semaphore(CFG.backend_pool_size)
 
+BLOCK_HEADERS = {'Connection': 'close', 'Cache-Control': 'no-store'}
+
 # --------------------------------------------------------------------------- #
 #  ASYNC‑SAFE LOGGING (non‑blocking QueueHandler)                             #
 # --------------------------------------------------------------------------- #
@@ -144,15 +179,15 @@ listener = logging.handlers.QueueListener(log_queue, file_handler, stream_handle
 listener.start()
 
 # --------------------------------------------------------------------------- #
-#  PURE PYTHON MICRO‑WAF ENGINE (No C‑extensions, safe against ReDoS)        #
+#  PURE PYTHON MICRO‑WAF ENGINE (ReDoS‑safe atomic regex)                    #
 # --------------------------------------------------------------------------- #
 _SQLI_PATTERNS = [
-    re.compile(r"\bunion\b.{0,50}\bselect\b", re.IGNORECASE | re.DOTALL),
-    re.compile(r"\bselect\b.{0,50}\bfrom\b", re.IGNORECASE | re.DOTALL),
-    re.compile(r"\binsert\b.{0,50}\binto\b", re.IGNORECASE | re.DOTALL),
-    re.compile(r"\bupdate\b.{0,50}\bset\b", re.IGNORECASE | re.DOTALL),
-    re.compile(r"\bdelete\b.{0,50}\bfrom\b", re.IGNORECASE | re.DOTALL),
-    re.compile(r"\bdrop\b.{0,50}\btable\b", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\bunion\b[^a-zA-Z0-9_]{0,50}\bselect\b", re.IGNORECASE),
+    re.compile(r"\bselect\b[^a-zA-Z0-9_]{0,50}\bfrom\b", re.IGNORECASE),
+    re.compile(r"\binsert\b[^a-zA-Z0-9_]{0,50}\binto\b", re.IGNORECASE),
+    re.compile(r"\bupdate\b[^a-zA-Z0-9_]{0,50}\bset\b", re.IGNORECASE),
+    re.compile(r"\bdelete\b[^a-zA-Z0-9_]{0,50}\bfrom\b", re.IGNORECASE),
+    re.compile(r"\bdrop\b[^a-zA-Z0-9_]{0,50}\btable\b", re.IGNORECASE),
     re.compile(r"'\s*(or|and)\s+['\d]", re.IGNORECASE),
     re.compile(r"(--|#|/\*)", re.IGNORECASE),
     re.compile(r"\b(sleep|benchmark|pg_sleep|waitfor)\b\s*\(", re.IGNORECASE),
@@ -175,7 +210,6 @@ waf_executor = concurrent.futures.ThreadPoolExecutor(
 )
 
 def waf_check(data: str) -> Optional[str]:
-    """Returns 'SQLi' or 'XSS' if attack detected, else None. Pure Python, ReDoS‑safe."""
     if not CFG.enable_waf or not data:
         return None
 
@@ -206,7 +240,7 @@ async def async_waf_check(data: str) -> Optional[str]:
     return await loop.run_in_executor(waf_executor, waf_check, data)
 
 # --------------------------------------------------------------------------- #
-#  RATE LIMITER & IP STATE (monotonic time)                                    #
+#  RATE LIMITER & IP STATE (fast cache, monotonic time)                       #
 # --------------------------------------------------------------------------- #
 class IPState:
     __slots__ = ("tokens","last_time","violations","last_violation_time","ban_until","active_conns")
@@ -221,7 +255,7 @@ class IPState:
 class RateLimiter:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self._store: TTLCache = TTLCache(maxsize=1_000_000, ttl=3600)
+        self._store = FastTTLCache(maxsize=100_000, ttl=3600)
 
     def _get(self, ip: str) -> IPState:
         state = self._store.get(ip)
@@ -248,7 +282,8 @@ class RateLimiter:
             s.last_violation_time = now
             ban_time = min(self.cfg.ban_max, self.cfg.ban_base * (self.cfg.ban_mult ** (s.violations - 1)))
             s.ban_until = now + ban_time
-            logger.warning("IP %s banned %.0fs (violations: %d)", ip, ban_time, s.violations)
+            if s.violations == 1 or s.violations % 10 == 0:
+                logger.warning("IP %s banned %.0fs (violations: %d)", ip, ban_time, s.violations)
             if self.cfg.enable_firewall and s.violations > 3:
                 logger.info("FIREWALL_BAN_IP=%s DURATION=%.0f", ip, ban_time)
         return False, s.tokens
@@ -327,7 +362,7 @@ class CircuitBreaker:
             return False
 
 # --------------------------------------------------------------------------- #
-#  SENTINEL APP (safe forwarding – no path normalization)                    #
+#  SENTINEL APP (whitelist empty, healthcheck separate)                       #
 # --------------------------------------------------------------------------- #
 class SentinelApp:
     def __init__(self, cfg: Config):
@@ -336,8 +371,9 @@ class SentinelApp:
         self.rate_limiter = RateLimiter(cfg)
         self.cb = CircuitBreaker(cfg.cb_error_threshold, cfg.cb_window, cfg.cb_probe_timeout)
         self._cleanup_task = None
-        self.ip_obj_cache = TTLCache(maxsize=200_000, ttl=3600)
-        self.ip_class_cache = TTLCache(maxsize=200_000, ttl=3600)
+        self.ip_obj_cache = FastTTLCache(maxsize=100_000, ttl=3600)
+        self.ip_class_cache = FastTTLCache(maxsize=100_000, ttl=3600)
+        self.endpoint_cache = FastTTLCache(maxsize=10_000, ttl=60)
 
     async def startup(self, app: web.Application):
         connector = TCPConnector(limit=self.cfg.backend_pool_size, ttl_dns_cache=300)
@@ -403,7 +439,7 @@ class SentinelApp:
 
     def _classify_ip(self, ip_str: str, ip_obj) -> str:
         if ip_str in self.ip_class_cache:
-            return self.ip_class_cache[ip_str]
+            return self.ip_class_cache[ip_str]  # Now subscriptable
 
         if any(ip_obj in net for net in CFG.blacklist_ips):
             cls = "blacklist"
@@ -421,7 +457,7 @@ class SentinelApp:
                 request.transport.abort()
             except Exception:
                 pass
-        return web.Response(status=444)
+        return web.Response(status=444, headers=BLOCK_HEADERS)
 
     async def handler(self, request: web.Request) -> web.Response:
         if INBOUND_CONN_SEM.locked():
@@ -435,20 +471,29 @@ class SentinelApp:
                 )
             except asyncio.TimeoutError:
                 return await self._blackhole(request, "Slowloris/Timeout")
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.error("Unhandled handler error: %s", e)
+                logger.critical("Unhandled catastrophic error: %s", e, exc_info=True)
                 return await self._blackhole(request, "Internal Error")
 
     async def _process_request(self, request: web.Request) -> web.Response:
         ip = self.get_real_ip(request)
 
         if len(request.path_qs) > CFG.max_uri_size:
-            return web.Response(status=414, text="URI Too Long")
+            return web.Response(status=414, text="URI Too Long", headers=BLOCK_HEADERS)
         if len(request.headers) > CFG.max_headers:
-            return web.Response(status=400, text="Too Many Headers")
+            return web.Response(status=400, text="Too Many Headers", headers=BLOCK_HEADERS)
         for name, value in request.headers.items():
             if len(name) > 256 or len(value) > CFG.max_header_size:
-                return web.Response(status=400, text="Header Too Large")
+                return web.Response(status=400, text="Header Too Large", headers=BLOCK_HEADERS)
+
+        path_key = f"{request.method}:{request.path}"
+        count_entry = self.endpoint_cache.get(path_key)
+        count = count_entry if count_entry else 0
+        if count > 200:
+            return await self._blackhole(request, "Endpoint Spam")
+        self.endpoint_cache[path_key] = count + 1
 
         ip_obj = self.ip_obj_cache.get(ip)
         if not ip_obj:
@@ -456,7 +501,7 @@ class SentinelApp:
                 ip_obj = ipaddress.ip_address(ip)
                 self.ip_obj_cache[ip] = ip_obj
             except ValueError:
-                return web.Response(status=400, text="Invalid IP")
+                return web.Response(status=400, text="Invalid IP", headers=BLOCK_HEADERS)
 
         ip_class = self._classify_ip(ip, ip_obj)
         if ip_class == "blacklist":
@@ -467,11 +512,11 @@ class SentinelApp:
         if self.rate_limiter.is_banned(ip):
             return await self._blackhole(request, "Banned")
         if not self.rate_limiter.inc_conn(ip):
-            return web.Response(status=429, text="Too many connections")
+            return web.Response(status=429, text="Too many connections", headers=BLOCK_HEADERS)
         allowed, _ = self.rate_limiter.acquire(ip)
         if not allowed:
             self.rate_limiter.dec_conn(ip)
-            return web.Response(status=429, text="Too Many Requests")
+            return web.Response(status=429, text="Too Many Requests", headers=BLOCK_HEADERS)
 
         ok, resp, body_chunk = await self._filter(request, ip)
         if not ok:
@@ -480,7 +525,7 @@ class SentinelApp:
 
         if not self.cb.allow():
             self.rate_limiter.dec_conn(ip)
-            return web.Response(status=503, text="Service Unavailable (circuit open)")
+            return web.Response(status=503, text="Service Unavailable (circuit open)", headers=BLOCK_HEADERS)
 
         try:
             return await self._forward(request, ip, body_chunk)
@@ -489,30 +534,30 @@ class SentinelApp:
 
     async def _filter(self, request: web.Request, ip: str) -> Tuple[bool, Optional[web.Response], Optional[bytes]]:
         if request.method not in CFG.allowed_methods:
-            return False, web.Response(status=405), None
+            return False, web.Response(status=405, headers=BLOCK_HEADERS), None
 
         ua = request.headers.get("User-Agent", "")
         if not ua:
-            return False, web.Response(status=403, text="Empty User-Agent"), None
+            return False, web.Response(status=403, text="Empty User-Agent", headers=BLOCK_HEADERS), None
         ua_lower = ua.lower()
         if any(bad in ua_lower for bad in CFG.bad_ua_patterns):
-            return False, web.Response(status=403, text="Forbidden"), None
+            return False, web.Response(status=403, text="Forbidden", headers=BLOCK_HEADERS), None
 
         if CFG.enable_waf:
             if await async_waf_check(request.path):
-                return False, web.Response(status=403, text="WAF Blocked"), None
+                return False, web.Response(status=403, text="WAF Blocked", headers=BLOCK_HEADERS), None
             if request.query_string and await async_waf_check(request.query_string):
-                return False, web.Response(status=403, text="WAF Blocked"), None
+                return False, web.Response(status=403, text="WAF Blocked", headers=BLOCK_HEADERS), None
             for header_name in ("Cookie", "Referer", "X-Forwarded-For"):
                 val = request.headers.get(header_name)
                 if val and await async_waf_check(val):
-                    return False, web.Response(status=403, text="WAF Blocked Header"), None
+                    return False, web.Response(status=403, text="WAF Blocked Header", headers=BLOCK_HEADERS), None
 
         body_chunk = None
         if request.can_read_body and request.method in ("POST", "PUT", "PATCH", "DELETE"):
             if WAF_SEM.locked():
                 logger.warning("WAF queue full – dropping %s", ip)
-                return False, await self._blackhole(request, "WAF Overloaded")
+                return False, await self._blackhole(request, "WAF Overloaded"), None
 
             async with WAF_SEM:
                 try:
@@ -521,12 +566,12 @@ class SentinelApp:
                     state = self.rate_limiter._get(ip)
                     state.violations += 5
                     self.rate_limiter.acquire(ip)
-                    return False, web.Response(status=413, text="Payload Too Large"), None
+                    return False, web.Response(status=413, text="Payload Too Large", headers=BLOCK_HEADERS), None
                 except (asyncio.TimeoutError, TimeoutError):
-                    return False, await self._blackhole(request, "Body Read Timeout")
+                    return False, await self._blackhole(request, "Body Read Timeout"), None
                 except Exception as e:
                     logger.error("Body read error: %s", e)
-                    return False, web.Response(status=400), None
+                    return False, web.Response(status=400, headers=BLOCK_HEADERS), None
 
                 if CFG.enable_waf and body_chunk:
                     try:
@@ -534,13 +579,16 @@ class SentinelApp:
                     except:
                         text = body_chunk.decode('latin-1')
                     if await async_waf_check(text):
-                        return False, web.Response(status=403, text="WAF Blocked"), None
+                        return False, web.Response(status=403, text="WAF Blocked", headers=BLOCK_HEADERS), None
 
         return True, None, body_chunk
 
     async def _forward(self, request: web.Request, ip: str, body_chunk: Optional[bytes]) -> web.Response:
-        # No path normalization – forward original path_qs to backend
-        url = f"{CFG.backend_url}{request.path_qs}"
+        path = request.path_qs
+        if CFG.backend_url.endswith('/') and path.startswith('/'):
+            url = CFG.backend_url + path[1:]
+        else:
+            url = CFG.backend_url + path
 
         headers = request.headers.copy()
         headers.pop('Host', None)
@@ -555,20 +603,14 @@ class SentinelApp:
         if remote_addr not in existing_ips:
             headers['X-Forwarded-For'] = f"{existing}, {remote_addr}" if existing else remote_addr
 
-        async def body_stream():
-            if body_chunk:
-                yield body_chunk
-            # body is already fully read, nothing more to stream from client
-            # but just in case, we stop here
-
         if OUTBOUND_REQ_SEM.locked():
             logger.warning("Backend pool exhausted – dropping %s", ip)
-            return web.Response(status=503, text="Service Unavailable")
+            return web.Response(status=503, text="Service Unavailable", headers=BLOCK_HEADERS)
         async with OUTBOUND_REQ_SEM:
             try:
                 resp = await self.session.request(
                     request.method, url, headers=headers,
-                    data=body_stream(), allow_redirects=False,
+                    data=body_chunk, allow_redirects=False,
                     ssl=CFG.verify_ssl
                 )
                 if resp.status >= 500:
@@ -598,10 +640,10 @@ class SentinelApp:
             except ClientError as e:
                 self.cb.record_error()
                 logger.error("Backend connection error for %s: %s", ip, e)
-                return web.Response(status=502, text="Bad Gateway")
+                return web.Response(status=502, text="Bad Gateway", headers=BLOCK_HEADERS)
             except asyncio.TimeoutError:
                 self.cb.record_error()
-                return web.Response(status=504, text="Gateway Timeout")
+                return web.Response(status=504, text="Gateway Timeout", headers=BLOCK_HEADERS)
 
 # --------------------------------------------------------------------------- #
 #  APPLICATION FACTORY                                                        #
@@ -616,9 +658,4 @@ def create_app():
     return app
 
 if __name__ == "__main__":
-    handler_args = {
-        'keepalive_timeout': 15,
-        'slow_request_timeout': 10
-    }
-    web.run_app(create_app(), host=CFG.listen_host, port=CFG.listen_port,
-                handle_signals=True, handler_args=handler_args)
+    web.run_app(create_app(), host=CFG.listen_host, port=CFG.listen_port, handle_signals=True)
