@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sentinel Guard v24.2 – Last Stand Absolute (Fail‑Fast Shard Locks)
+Sentinel Guard v24.3 – Last Stand Absolute (Fail‑Closed on overload)
 Production‑hardened, single‑file Python async anti‑DDoS layer‑7 wall.
 Works on Linux, Windows, macOS – no C‑extensions, no root required.
 Tested with: aiohttp >= 3.8, Python 3.9+.
@@ -751,7 +751,7 @@ class CircuitBreaker:
 
 
 # --------------------------------------------------------------------------- #
-#  SentinelApp – fail‑fast locks, no cache‑busting false positives             #
+#  SentinelApp – fail‑fast locks, fail‑closed on overload                      #
 # --------------------------------------------------------------------------- #
 class SentinelApp:
     def __init__(self, cfg: Config):
@@ -1043,23 +1043,28 @@ class SentinelApp:
         return True
 
     # ------------------------------------------------------------------- #
-    #  IP classification                                                    #
+    #  IP classification – FAIL‑CLOSED on lock timeout                      #
     # ------------------------------------------------------------------- #
     async def _classify_ip(self, ip_str: str, ip_obj) -> str:
         if ip_str in self.ip_class_cache:
             return self.ip_class_cache[ip_str]
+
         lock = self._get_counter_lock(ip_str)
         if not await self._try_lock(lock):
-            return "normal"
+            # System overloaded → assume hostile and drop via blackhole
+            return "blacklist"
+
         try:
             if ip_str in self.ip_class_cache:
                 return self.ip_class_cache[ip_str]
+
             if self._ip_matches_networks(ip_str, CFG.blacklist_ips):
                 cls = "blacklist"
             elif self._ip_matches_networks(ip_str, CFG.whitelist_ips):
                 cls = "whitelist"
             else:
                 cls = "normal"
+
             self.ip_class_cache[ip_str] = cls
             return cls
         finally:
