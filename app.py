@@ -1,40 +1,6 @@
 #!/usr/bin/env python3
 """
-Sentinel Guard v23.0 – Last Stand Absolute (DDoS-hardened single-file edition)
-
-Queue of v23.0 changes vs v22.14:
-
-  1. JSON.parse + recursive WAF scan fully offloaded to ThreadPoolExecutor
-     (the previous version called json.loads directly on the event loop, which
-      could stall asyncio under JSON-depth-bomb attacks at scale).
-  2. Backend-unhealthy flag now actually sheds traffic (before it only
-     labelled /health responses). Non-whitelisted callers get 503 when the
-     upstream is down so they don't drown the backend.
-  3. URL forwarding is SSRF-safe regardless of incoming absolute-form
-     requests (path lstrip("/"), backend rstrip("/")).
-  4. Host header validation (presence, length, optional allow-list).
-  5. HTTP version whitelist (1.0 / 1.1 tunnelled, 2.0 / 0.9 rejected).
-  6. Content-Length integer validation (prevents int-overflow / 500 crash DoS).
-  7. SUSPICIOUS_CHARS fast-path coverage expanded (backslash, ctrl chars,
-     tabs, newlines, NUL, asterisk, braces, brackets) – tighter WAF fast path.
-  8. Counter locks split into a metrics lock and an active-counts lock –
-     the previous shared lock became a hotspot under sustained 5k–10k RPS.
-  9. DDoS-friendly defaults:                  RATE_LIMIT=200
-                                              BURST_LIMIT=400
-                                              GLOBAL_PER_IP_LIMIT=500
-                                              PER_IP_ENDPOINT_LIMIT=120
-                                              HEALTH_CHECK_LIMIT=30
-                                              UNIQUE_QUERY_THRESHOLD=50
- 10. Real 431 (Request Header Fields Too Large) status – was 400 before.
- 11. CONNECT method always explicitly rejected (was implicit).
- 12. Body chunk-read exception coverage widened (ClientPayloadError,
-     ClientDisconnectedError, asyncio.IncompleteReadError).
- 13. Audit log payloads include method, path-QS, status for triage.
- 14. Cleanup loop now actually prunes a sample of rate-limiter caches
-     so abandoned per-IP state cannot pin memory forever.
- 15. /metrics endpoint now requires Host header == SENTINEL_HOST or
-     "localhost" in addition to localhost IP check.
-
+Sentinel Guard v23.5 – Last Stand Absolute (health‑check disabled by default)
 Production‑hardened, single‑file Python async anti‑DDoS layer‑7 wall.
 Works on Linux, Windows, macOS – no C‑extensions, no root required.
 Tested with: aiohttp >= 3.8, Python 3.9+.
@@ -49,28 +15,24 @@ import logging
 import logging.handlers
 import os
 import queue
-import random
 import re
 import sys
 import time
 import uuid
 from collections import deque, OrderedDict
 from typing import Dict, Iterable, List, Optional, Set, Tuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector, ClientError
 
 try:
-    # aiohttp signals payload errors; handle gracefully on disconnect.
     from aiohttp import ClientPayloadError, ClientDisconnectedError
-except ImportError:  # pragma: no cover – older aiohttp fallback paths.
+except ImportError:
     ClientPayloadError = ClientError
     ClientDisconnectedError = ClientError
 
 # --------------------------------------------------------------------------- #
-#  Constants – bumped defaults give legitimate clients head-room so the         #
-#  rate-limiter spends its energy on real abuse, not on bot users with          #
-#  legitimate page bursts (HTML + JS + CSS + favicons).                         #
+#  Constants                                                                    #
 # --------------------------------------------------------------------------- #
 DEFAULT_CACHE_MAXSIZE = 100_000
 DEFAULT_CACHE_TTL = 3600
@@ -92,14 +54,15 @@ DEFAULT_MAX_TOTAL_HEADERS_SIZE = 65536
 WAF_INSPECT_SIZE = 8192
 WAF_BODY_TIMEOUT = 5.0
 WAF_MAX_WORKERS = 64
+WAF_REGEX_TIMEOUT = 2.0                 # per‑check timeout to prevent ReDoS
 
-DEFAULT_PER_IP_ENDPOINT_LIMIT = 120      # was 30 – legit browsers need more
+DEFAULT_PER_IP_ENDPOINT_LIMIT = 120
 DEFAULT_PER_IP_ENDPOINT_TTL = 60
 
-DEFAULT_GLOBAL_PER_IP_LIMIT = 500       # was 100
+DEFAULT_GLOBAL_PER_IP_LIMIT = 500
 DEFAULT_GLOBAL_PER_IP_TTL = 60
 
-HEALTH_CHECK_LIMIT = 30                 # was 10
+HEALTH_CHECK_LIMIT = 30
 HEALTH_CHECK_TTL = 60
 
 MAX_SAFE_CONNS_LINUX = 15000
@@ -120,7 +83,7 @@ STREAM_CHUNK_SIZE = 8192
 BACKEND_TIMEOUT = 30.0
 
 KEEPALIVE_TIMEOUT = 15
-SLOW_REQUEST_TIMEOUT = 8                 # tightened from 10
+SLOW_REQUEST_TIMEOUT = 8
 
 DEFAULT_LOG_QUEUE_MAXSIZE = 5000
 
@@ -140,26 +103,27 @@ IP_CLASS_CACHE_TTL = 3600
 
 UNIQUE_QUERY_CACHE_MAXSIZE = 50_000
 UNIQUE_QUERY_CACHE_TTL = 300
-UNIQUE_QUERY_THRESHOLD = 50              # was 20
+UNIQUE_QUERY_THRESHOLD = 50
 
 SHARD_LOCK_COUNT = 1024
 
-BACKEND_MAX_RETRIES = 2                 # was 1 – legitimate backend blips
+BACKEND_MAX_RETRIES = 2
 
 MAX_JSON_ELEMENTS = 1000
 MAX_JSON_DEPTH = 10
 
-ALLOWED_HTTP_VERSIONS = frozenset({"1.0", "1.1"})
+ALLOWED_HTTP_VERSIONS = frozenset({(1, 0), (1, 1)})
 
-# --------------------------------------------------------------------------- #
-#  WAF fast-path character set – extended to cover:                              #
-#      backslash, tab/CR/LF/NUL (header smuggling), asterisk (wildcard SQLi),    #
-#      curly / square brackets (proto pollution, JSON keys), exclamation, hash. #
-# --------------------------------------------------------------------------- #
+# WAF fast-path
 SUSPICIOUS_CHARS = set("'<>();-=%&|`\\/\t\r\n\x00*?!#.")
+_SQLI_KEYWORDS = (
+    "union", "select", "insert", "update", "delete", "drop",
+    "sleep", "benchmark", "waitfor", "information_schema",
+    "__proto__", "javascript", "<script"
+)
 
 # --------------------------------------------------------------------------- #
-#  Raise file descriptor limit – non-fatal on every platform.                    #
+#  Raise file descriptor limit (non‑fatal)                                     #
 # --------------------------------------------------------------------------- #
 if sys.platform != "win32":
     try:
@@ -172,7 +136,7 @@ if sys.platform != "win32":
         pass
 
 # --------------------------------------------------------------------------- #
-#  Fast LRU + TTL cache – O(1) get/set with strict size + expiry eviction.      #
+#  Fast LRU + TTL cache                                                        #
 # --------------------------------------------------------------------------- #
 class FastTTLCache:
     __slots__ = ("_data", "_maxsize", "_ttl")
@@ -193,6 +157,8 @@ class FastTTLCache:
         return item[0]
 
     def __setitem__(self, key: str, value):
+        if len(self._data) >= self._maxsize - 10:
+            self._purge_expired(max(1, len(self._data) // 10))
         if key in self._data:
             self._data.move_to_end(key)
         elif len(self._data) >= self._maxsize:
@@ -210,15 +176,24 @@ class FastTTLCache:
         return bool(item) and item[1] >= time.monotonic()
 
     def items(self):
-        """Snapshot iteration; safe to call concurrently with reads."""
         return list(self._data.items())
 
     def __len__(self) -> int:
         return len(self._data)
 
+    def _purge_expired(self, limit: int = 50):
+        now = time.monotonic()
+        for _ in range(limit):
+            if not self._data:
+                break
+            key, (_, ts) = next(iter(self._data.items()))
+            if ts < now:
+                del self._data[key]
+            else:
+                break
 
 # --------------------------------------------------------------------------- #
-#  Configuration – env-driven with strict integer / float clamping.             #
+#  Configuration                                                               #
 # --------------------------------------------------------------------------- #
 class Config:
     @staticmethod
@@ -292,12 +267,10 @@ class Config:
         self.whitelist_ips   = self._parse_networks(os.getenv("WHITELIST", ""))
         self.blacklist_ips   = self._parse_networks(os.getenv("BLACKLIST", ""))
 
-        # Default block includes CONNECT / TRACE / TRACK explicitly.
         env_methods = os.getenv("ALLOWED_METHODS", "GET,POST,HEAD,PUT,DELETE,OPTIONS,PATCH")
         self.allowed_methods = set(
             m.strip().upper() for m in env_methods.split(",") if m.strip()
         )
-        # Even if an operator accidentally adds CONNECT/TRACE, we always strip.
         self.allowed_methods.discard("CONNECT")
         self.allowed_methods.discard("TRACE")
         self.allowed_methods.discard("TRACK")
@@ -331,7 +304,6 @@ class Config:
         self.cb_probe_timeout   = self._safe_int(os.getenv("CB_TIMEOUT", ""), DEFAULT_CB_PROBE_TIMEOUT, 1)
 
         self.cleanup_interval   = self._safe_int(os.getenv("CLEANUP_INTERVAL", ""), DEFAULT_CLEANUP_INTERVAL, 1)
-
         self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
         if self.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             self.log_level = "INFO"
@@ -345,15 +317,20 @@ class Config:
 
         self.ipv6_prefix = self._safe_int(os.getenv("IPV6_PREFIX", ""), 64, 16, 128)
 
-        # Optional: host-header allow-list (comma separated FQDN suffixes).
         raw_hosts = os.getenv("ALLOWED_HOSTS", "")
         self.allowed_hosts = set(h.strip().lower() for h in raw_hosts.split(",") if h.strip())
+
+        # Health‑check – disabled by default to avoid self‑DoS when backend lacks /health
+        self.health_check_enabled = os.getenv("BACKEND_HEALTH_CHECK", "0") == "1"
+        self.health_path = os.getenv("BACKEND_HEALTH_PATH", "/health").strip()
+        if not self.health_path.startswith("/"):
+            self.health_path = "/" + self.health_path
 
 
 CFG = Config()
 
 # --------------------------------------------------------------------------- #
-#  Global resources – lazy to keep imports side-effect free.                    #
+#  Global resources                                                           #
 # --------------------------------------------------------------------------- #
 waf_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 listener: Optional[logging.handlers.QueueListener] = None
@@ -362,7 +339,7 @@ log_queue: "queue.Queue" = queue.Queue(maxsize=CFG.log_queue_maxsize)
 audit_log_queue: "queue.Queue" = queue.Queue(maxsize=CFG.log_queue_maxsize)
 
 # --------------------------------------------------------------------------- #
-#  Cross-platform FD accounting – safe on every OS.                             #
+#  FD accounting                                                              #
 # --------------------------------------------------------------------------- #
 try:
     if sys.platform != "win32":
@@ -382,7 +359,7 @@ OUTBOUND_REQ_SEM = asyncio.Semaphore(CFG.backend_pool_size)
 BLOCK_HEADERS = {"Connection": "close", "Cache-Control": "no-store"}
 
 # --------------------------------------------------------------------------- #
-#  Logging – non-blocking, structured audit log, automatic rotation.            #
+#  Logging                                                                     #
 # --------------------------------------------------------------------------- #
 class NonBlockingQueueHandler(logging.handlers.QueueHandler):
     def emit(self, record):
@@ -421,9 +398,8 @@ audit_logger.propagate = False
 _formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 _audit_formatter = JSONFormatter()
 
-
 # --------------------------------------------------------------------------- #
-#  Pure-Python Micro-WAF – regex set; fast-path skips benign payloads.           #
+#  Micro‑WAF engine                                                            #
 # --------------------------------------------------------------------------- #
 _SQLI_PATTERNS = [
     re.compile(r"(?<![a-zA-Z0-9_])(sleep|benchmark|pg_sleep|waitfor)\s*\(", re.IGNORECASE),
@@ -458,9 +434,6 @@ _PROTO_POLLUTION_PATTERNS = [
     re.compile(r"\bprototype\b", re.IGNORECASE),
 ]
 
-# --------------------------------------------------------------------------- #
-#  Helper: aggressive decoding (URL-decode twice then strip CRLF, NUL).          #
-# --------------------------------------------------------------------------- #
 def _decode_aggressive(data: str) -> str:
     cleaned = data
     for _ in range(3):
@@ -468,26 +441,17 @@ def _decode_aggressive(data: str) -> str:
         if new_cleaned == cleaned:
             break
         cleaned = new_cleaned
-    # Strip control characters used in CRLF / null / RST header smuggling.
     cleaned = cleaned.replace("\x00", "").replace("\r", "").replace("\n", "").replace("\t", "")
     return cleaned
 
 
-# --------------------------------------------------------------------------- #
-#  WAF synchronous check (runs inside ThreadPoolExecutor).                      #
-# --------------------------------------------------------------------------- #
 def waf_check(data: str) -> Optional[str]:
     if not CFG.enable_waf or not data:
         return None
 
-    # Fast-path – bail out before regex if data is clean.
     data_lower = data.lower()
     if not any(c in SUSPICIOUS_CHARS for c in data) and \
-       not any(kw in data_lower for kw in ("union", "select", "insert",
-                                            "update", "delete", "drop",
-                                            "sleep", "benchmark", "waitfor",
-                                            "information_schema", "__proto__",
-                                            "javascript", "<script")):
+       not any(kw in data_lower for kw in _SQLI_KEYWORDS):
         return None
 
     try:
@@ -514,13 +478,18 @@ def waf_check(data: str) -> Optional[str]:
 
 async def async_waf_check(data: str) -> Optional[str]:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(waf_executor, waf_check, data)
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(waf_executor, waf_check, data),
+            timeout=WAF_REGEX_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.error("WAF regex timeout – possible ReDoS attempt")
+        return "ERROR"
+    except Exception:
+        return "ERROR"
 
 
-# --------------------------------------------------------------------------- #
-#  Composite executor helper – JSON parse + recursive WAF scan in one call       #
-#  so neither json.loads nor _json_scan ever blocks the event loop.             #
-# --------------------------------------------------------------------------- #
 def _json_parse_and_scan(text: str) -> Optional[str]:
     try:
         obj = json.loads(text)
@@ -555,7 +524,7 @@ def _json_scan(obj, max_depth: int = MAX_JSON_DEPTH, _count: Optional[List[int]]
 
 
 # --------------------------------------------------------------------------- #
-#  Per-IP state + rate-limiter – sharded locks to avoid contention.              #
+#  Rate limiter                                                                #
 # --------------------------------------------------------------------------- #
 class IPState:
     __slots__ = ("tokens", "last_time", "violations", "last_violation_time",
@@ -663,16 +632,18 @@ class RateLimiter:
             if s and s.active_conns > 0:
                 s.active_conns -= 1
 
-    def force_ban(self, ip: str, duration: float = None, request_id: str = None):
+    async def force_ban(self, ip: str, duration: float = None, request_id: str = None):
         key = self._get_rate_limit_key(ip)
         if duration is None:
             duration = self.cfg.ban_max
-        self._ban_store[key] = time.monotonic() + duration
-        s = self._store.get(key)
-        if s:
-            s.tokens = 0.0
-            s.violations = 100
-            s.last_time = time.monotonic()
+        lock = self._get_shard_lock(key)
+        async with lock:
+            self._ban_store[key] = time.monotonic() + duration
+            s = self._store.get(key)
+            if s:
+                s.tokens = 0.0
+                s.violations = 100
+                s.last_time = time.monotonic()
         audit_logger.warning(
             "FORCE_BAN %s %.0fs", ip, duration,
             extra={"request_id": request_id or "n/a", "ip": ip, "reason": "force_ban", "duration": duration},
@@ -690,22 +661,22 @@ class RateLimiter:
             return True
         return state.first_seen > 0 and (time.monotonic() - state.first_seen) < 300
 
-    def prune_if_possible(self):
-        """Sample read of the ban store to allow FastTTLCache LRU eviction of
-        expired entries even for IPs that never come back."""
-        items = self._ban_store.items()
+    async def prune_caches(self, batch_limit: int = 1024):
         now = time.monotonic()
-        # Touch a few to trigger lazy eviction; the cache itself enforces
-        # size limits, so worst-case memory is bounded.
-        for k, (_, ts) in items[:128]:
-            if ts < now:
-                # FastTTLCache.get(k) would prune on next get; we just
-                # refresh its position so eviction order matches TTL.
-                self._ban_store.get(k)
+        for store in (self._ban_store, self._store):
+            for _ in range(batch_limit):
+                if not store._data:
+                    break
+                key, (_, ts) = next(iter(store._data.items()))
+                if ts < now:
+                    store._data.pop(key, None)
+                else:
+                    break
+            await asyncio.sleep(0)
 
 
 # --------------------------------------------------------------------------- #
-#  Circuit Breaker – correct HALF_OPEN transition with lock.                    #
+#  Circuit breaker                                                             #
 # --------------------------------------------------------------------------- #
 class CircuitBreaker:
     def __init__(self, err_thr: int, window: float, probe_timeout: float):
@@ -724,8 +695,6 @@ class CircuitBreaker:
         self._errors.append(now)
         while self._errors and self._errors[0] < now - self.window:
             self._errors.popleft()
-        # Cap deque length even in OPEN state (would otherwise grow unbounded
-        # if a flurry of failures arrives while OPEN).
         while len(self._errors) > self.err_thr + 50:
             self._errors.popleft()
         self._last_failure = now
@@ -769,7 +738,7 @@ class CircuitBreaker:
 
 
 # --------------------------------------------------------------------------- #
-#  SentinelApp – the proxy itself.                                              #
+#  SentinelApp                                                                 #
 # --------------------------------------------------------------------------- #
 class SentinelApp:
     def __init__(self, cfg: Config):
@@ -779,6 +748,7 @@ class SentinelApp:
         self.cb = CircuitBreaker(cfg.cb_error_threshold, cfg.cb_window, cfg.cb_probe_timeout)
         self._cleanup_task = None
         self._health_task = None
+        # When health‑check is disabled, backend is always considered healthy
         self._backend_healthy = True
         self.ip_obj_cache = FastTTLCache(maxsize=IP_OBJ_CACHE_MAXSIZE, ttl=IP_OBJ_CACHE_TTL)
         self.ip_class_cache = FastTTLCache(maxsize=IP_CLASS_CACHE_MAXSIZE, ttl=IP_CLASS_CACHE_TTL)
@@ -786,8 +756,6 @@ class SentinelApp:
         self.global_per_ip_cache = FastTTLCache(maxsize=STATE_STORE_MAXSIZE, ttl=DEFAULT_GLOBAL_PER_IP_TTL)
         self.unique_query_cache = FastTTLCache(maxsize=UNIQUE_QUERY_CACHE_MAXSIZE, ttl=UNIQUE_QUERY_CACHE_TTL)
 
-        # Split locks – the previous _counter_lock wedge inflated tail latency
-        # when ~everything took the same lock.
         self._counter_locks: List[asyncio.Lock] = [asyncio.Lock() for _ in range(SHARD_LOCK_COUNT)]
         self._metrics_lock = asyncio.Lock()
         self._active_lock = asyncio.Lock()
@@ -811,7 +779,7 @@ class SentinelApp:
 
     def _audit_extra(self, request: web.Request) -> Dict:
         return {
-            "request_id": request.get("request_id", "unknown"),
+            "request_id": request["request_id"],
             "ip": getattr(request, "_audit_ip", "n/a"),
             "method": request.method,
             "path": request.path_qs[:512],
@@ -861,7 +829,10 @@ class SentinelApp:
         timeout = ClientTimeout(total=self.cfg.backend_timeout, connect=5, sock_read=10, sock_connect=5)
         self.session = ClientSession(connector=connector, timeout=timeout, auto_decompress=False)
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-        self._health_task = asyncio.create_task(self._health_check_loop())
+
+        # Only start health‑check task if explicitly enabled
+        if self.cfg.health_check_enabled:
+            self._health_task = asyncio.create_task(self._health_check_loop())
 
     async def shutdown(self, app: web.Application):
         self._shutdown_event.set()
@@ -907,28 +878,33 @@ class SentinelApp:
                 pass
             loop = asyncio.get_running_loop()
             try:
-                # 1) Help rate-limiter cache evict truly dead entries.
-                self.rate_limiter.prune_if_possible()
-                # 2) System GC – offload so it can't stall request loop.
+                await self.rate_limiter.prune_caches(batch_limit=1024)
                 await loop.run_in_executor(None, gc.collect)
             except Exception as e:
                 logger.debug("Cleanup loop iteration error: %s", e)
 
     async def _backend_health_check(self):
+        """Return True if backend is healthy, False otherwise."""
+        if not self.cfg.health_check_enabled:
+            return True
         try:
-            async with self.session.get(f"{CFG.backend_url}/health", timeout=5) as r:
-                self._backend_healthy = (r.status == 200)
-                return self._backend_healthy
+            async with self.session.get(
+                f"{CFG.backend_url}{self.cfg.health_path}", timeout=5
+            ) as r:
+                return r.status == 200
         except Exception:
-            self._backend_healthy = False
             return False
 
     async def _health_check_loop(self):
+        """Periodic health‑check loop – only runs when enabled."""
         while not self._shutdown_event.is_set():
-            try:
-                await self._backend_health_check()
-            except Exception as e:
-                logger.debug("Health-check error: %s", e)
+            healthy = await self._backend_health_check()
+            if healthy != self._backend_healthy:
+                self._backend_healthy = healthy
+                if healthy:
+                    logger.info("Backend is healthy again")
+                else:
+                    logger.warning("Backend is unhealthy – shedding traffic")
             await asyncio.sleep(30)
 
     # ------------------------------------------------------------------- #
@@ -936,11 +912,11 @@ class SentinelApp:
     # ------------------------------------------------------------------- #
     def _err(self, request, status, text=""):
         headers = dict(BLOCK_HEADERS)
-        headers["X-Request-ID"] = request.get("request_id", "unknown")
+        headers["X-Request-ID"] = request["request_id"]
         return web.Response(status=status, text=text, headers=headers)
 
     # ------------------------------------------------------------------- #
-    #  IP / XFF handling                                                    #
+    #  IP / XFF                                                              #
     # ------------------------------------------------------------------- #
     @staticmethod
     def _normalize_ip(ip_str: str) -> str:
@@ -998,21 +974,10 @@ class SentinelApp:
         return normalized
 
     # ------------------------------------------------------------------- #
-    #  Hop-by-hop header handling (RFC 7230)                                #
+    #  Hop‑by‑hop headers (separate for request and response)               #
     # ------------------------------------------------------------------- #
     @staticmethod
-    def _is_valid_transfer_encoding(headers) -> bool:
-        te_values = headers.getall("Transfer-Encoding", [])
-        if len(te_values) > 1:
-            return False
-        if te_values:
-            te = te_values[0].strip().lower()
-            if te not in ("chunked", "identity"):
-                return False
-        return True
-
-    @staticmethod
-    def filter_hop(headers):
+    def filter_hop_request(headers):
         hop_lower = {"transfer-encoding", "connection", "keep-alive",
                      "proxy-authenticate", "proxy-authorization", "te",
                      "trailers", "trailer", "upgrade", "content-length"}
@@ -1024,8 +989,36 @@ class SentinelApp:
             if key.lower() in hop_lower:
                 del headers[key]
 
+    @staticmethod
+    def filter_hop_response(headers):
+        hop_lower = {"transfer-encoding", "connection", "keep-alive",
+                     "proxy-authenticate", "proxy-authorization", "te",
+                     "trailers", "trailer", "upgrade"}
+        conn_vals = headers.getall("Connection", [])
+        for val in conn_vals:
+            for directive in val.split(","):
+                hop_lower.add(directive.strip().lower())
+        for key in list(headers.keys()):
+            if key.lower() in hop_lower:
+                del headers[key]
+
     # ------------------------------------------------------------------- #
-    #  IP classification (whitelist / blacklist)                              #
+    #  Transfer‑Encoding validation                                        #
+    # ------------------------------------------------------------------- #
+    @staticmethod
+    def _is_valid_transfer_encoding(headers) -> bool:
+        te_values = headers.getall("Transfer-Encoding", [])
+        if len(te_values) > 1:
+            return False
+        if te_values:
+            tokens = [t.strip().lower() for t in te_values[0].split(",") if t.strip()]
+            for token in tokens:
+                if token not in ("chunked", "identity"):
+                    return False
+        return True
+
+    # ------------------------------------------------------------------- #
+    #  IP classification                                                    #
     # ------------------------------------------------------------------- #
     async def _classify_ip(self, ip_str: str, ip_obj) -> str:
         if ip_str in self.ip_class_cache:
@@ -1044,7 +1037,7 @@ class SentinelApp:
             return cls
 
     # ------------------------------------------------------------------- #
-    #  Blackhole / abort TCP                                                 #
+    #  Blackhole                                                             #
     # ------------------------------------------------------------------- #
     async def _blackhole(self, request: web.Request, ip: str, reason: str = "Banned") -> web.Response:
         async with self._metrics_lock:
@@ -1056,17 +1049,21 @@ class SentinelApp:
                 request.transport.abort()
             except (OSError, RuntimeError):
                 pass
-        request_id = request.get("request_id", "unknown")
-        # Per-IP metric increment
-        async with self._active_lock:
-            self._metrics.setdefault("slow_aborts", 0)
         audit_logger.warning("BLACKHOLE %s reason=%s", ip, reason,
                              extra=self._audit_extra(request))
         return web.Response(status=444)
 
     # ------------------------------------------------------------------- #
-    #  HTTP version, Host, Content-Length header validators                 #
+    #  HTTP version (fixed tuple comparison)                               #
     # ------------------------------------------------------------------- #
+    @staticmethod
+    def _allowed_version(request: web.Request) -> bool:
+        try:
+            ver = request.version
+            return (ver.major, ver.minor) in ALLOWED_HTTP_VERSIONS
+        except (AttributeError, KeyError):
+            return True
+
     @staticmethod
     def _valid_host(request: web.Request) -> bool:
         host = request.headers.get("Host")
@@ -1080,8 +1077,6 @@ class SentinelApp:
 
     @staticmethod
     def _valid_cl(request) -> bool:
-        """True iff Content-Length is present at most once and parses as a non-negative
-        int.  REJECTS duplicate Content-Length headers (HTTP request smuggling CL/CL attack)."""
         cl_values = request.headers.getall("Content-Length", [])
         if not cl_values:
             return True
@@ -1095,16 +1090,8 @@ class SentinelApp:
             return False
         return True
 
-    @staticmethod
-    def _allowed_version(request: web.Request) -> bool:
-        try:
-            return request.version in ALLOWED_HTTP_VERSIONS
-        except (AttributeError, KeyError):
-            # Fall back to literal major parsing for older aiohttp.
-            return True
-
     # ------------------------------------------------------------------- #
-    #  Top-level handler                                                   #
+    #  Top‑level handler                                                    #
     # ------------------------------------------------------------------- #
     async def handler(self, request: web.Request) -> web.Response:
         async with self._metrics_lock:
@@ -1127,7 +1114,6 @@ class SentinelApp:
                 return web.Response(status=403)
             return web.json_response(self._metrics)
 
-        # Shutdown / overload – abort TCP, return no body (444 = nginx style).
         if self._shutdown_event.is_set():
             if request.transport and not request.transport.is_closing():
                 try:
@@ -1172,15 +1158,15 @@ class SentinelApp:
     #  Core request processing                                              #
     # ------------------------------------------------------------------- #
     async def _process_request(self, request: web.Request) -> web.Response:
-        ip = self.get_real_ip(request)
-        request_id = request.get("request_id", "unknown")
+        ip = request._audit_ip
+        request_id = request["request_id"]
         logger.debug("Request %s from %s", request_id, ip)
 
-        # 1) HTTP version enforcement – close connection on bad/missing.
+        # 1) HTTP version
         if not self._allowed_version(request):
             return self._err(request, 400, "Bad HTTP version")
 
-        # 2) Host header validation (anti-smuggling).
+        # 2) Host header
         if not self._valid_host(request):
             return self._err(request, 400, "Invalid Host header")
         if CFG.allowed_hosts:
@@ -1188,7 +1174,7 @@ class SentinelApp:
             if not any(host_lc == h or host_lc.endswith("." + h) for h in CFG.allowed_hosts):
                 return self._err(request, 400, "Host not allowed")
 
-        # 3) Health-check fast path with per-IP cap.
+        # 3) /health
         if request.path == "/health":
             health_key = f"health:{ip}"
             lock = self._get_counter_lock(health_key)
@@ -1200,23 +1186,23 @@ class SentinelApp:
             return web.Response(text="OK" if self._backend_healthy else "DEGRADED",
                                 status=200 if self._backend_healthy else 503)
 
-        # 4) CONNECT/TRACE-style method defense (even before header checks).
+        # 4) Method
         if request.method.upper() not in CFG.allowed_methods:
             audit_logger.warning("METHOD_BLOCKED %s %s", ip, request.method,
                                  extra=self._audit_extra(request))
             return self._err(request, 405, "Method Not Allowed")
 
-        # 5) Transfer-Encoding validation.
+        # 5) Transfer-Encoding (improved)
         if not self._is_valid_transfer_encoding(request.headers):
             return self._err(request, 400, "Bad Transfer-Encoding")
         if request.headers.get("Transfer-Encoding") and request.headers.get("Content-Length"):
             return self._err(request, 400, "Bad Request: TE + CL conflict")
 
-        # 6) Content-Length integer validity (avoid 500-crash DoS).
+        # 6) Content-Length
         if not self._valid_cl(request):
             return self._err(request, 400, "Invalid Content-Length")
 
-        # 7) Total header size + header count + header line size caps.
+        # 7) Header caps
         total_headers_size = sum(len(k) + len(v) + 2 for k, v in request.headers.items())
         if total_headers_size > CFG.max_total_headers_size:
             return self._err(request, 431, "Headers too large")
@@ -1228,19 +1214,19 @@ class SentinelApp:
             if len(name) > 256 or len(value) > CFG.max_header_size:
                 return self._err(request, 431, "Header Too Large")
 
-        # 8) Global per-IP limit (atomic).
+        # 8) Global per-IP
         global_ip_key = f"global:{ip}"
         lock = self._get_counter_lock(global_ip_key)
         async with lock:
             global_ip_count = self.global_per_ip_cache.get(global_ip_key) or 0
             if global_ip_count > CFG.global_per_ip_limit:
-                self.rate_limiter.force_ban(ip, self.cfg.ban_max, request_id)
+                await self.rate_limiter.force_ban(ip, self.cfg.ban_max, request_id)
                 audit_logger.warning("GLOBAL_LIMIT_BAN %s", ip,
                                      extra=self._audit_extra(request))
                 return await self._blackhole(request, ip, "Global IP Limit Exceeded")
             self.global_per_ip_cache[global_ip_key] = global_ip_count + 1
 
-        # 9) Unique-query scraper-pattern detection.
+        # 9) Unique-query scraper
         if request.query_string:
             uq_key = f"uq:{ip}"
             lock = self._get_counter_lock(uq_key)
@@ -1252,14 +1238,14 @@ class SentinelApp:
                 if request.query_string not in seen:
                     seen[request.query_string] = None
                     if len(seen) > UNIQUE_QUERY_THRESHOLD:
-                        self.rate_limiter.force_ban(ip, request_id=request_id)
+                        await self.rate_limiter.force_ban(ip, request_id=request_id)
                         audit_logger.warning(
                             "SCRAPER_PATTERN %s unique=%d", ip, len(seen),
                             extra=self._audit_extra(request))
                         self.unique_query_cache[uq_key] = OrderedDict()
                         return await self._blackhole(request, ip, "Scraper Pattern")
 
-        # 10) Per-IP endpoint limit (atomic).
+        # 10) Per-IP endpoint
         endpoint_hash = hash(request.path) & 0xFFFFFFFF
         endpoint_key = f"{ip}:{request.method}:{endpoint_hash}"
         lock = self._get_counter_lock(endpoint_key)
@@ -1270,7 +1256,7 @@ class SentinelApp:
                 return await self._blackhole(request, ip, "Endpoint Spam")
             self.per_ip_endpoint_cache[endpoint_key] = count + 1
 
-        # 11) IP classification caching.
+        # 11) IP classification
         ip_obj = self.ip_obj_cache.get(ip)
         if not ip_obj:
             try:
@@ -1284,7 +1270,7 @@ class SentinelApp:
                                  extra=self._audit_extra(request))
             return await self._blackhole(request, ip, "Blacklisted")
 
-        # 12) Rate-limit.  Whitelisted IPs skip ban *writes* but still cap conns.
+        # 12) Rate-limit
         if ip_class == "whitelist":
             allowed, _, reason = await self.rate_limiter.check_and_acquire(
                 ip, bypass_ban=True, bypass_ban_writes=True,
@@ -1309,8 +1295,8 @@ class SentinelApp:
                 return self._err(request, 429, "Too many connections")
             return self._err(request, 429, "Too Many Requests")
 
-        # 13) Backend unhealthy shedding (NEW – previously only labelled).
-        if not self._backend_healthy:
+        # 13) Backend unhealthy shedding (only when health‑check is enabled)
+        if self.cfg.health_check_enabled and not self._backend_healthy:
             async with self._metrics_lock:
                 self._metrics["blocked"] += 1
             return self._err(request, 503, "Backend Unavailable")
@@ -1328,7 +1314,7 @@ class SentinelApp:
             await self.rate_limiter.dec_conn(ip)
 
     # ------------------------------------------------------------------- #
-    #  Banner / UA / WAF + body inspection                                  #
+    #  WAF + body inspection                                                #
     # ------------------------------------------------------------------- #
     @staticmethod
     def _is_text_content(content_type: Optional[str]) -> bool:
@@ -1343,6 +1329,14 @@ class SentinelApp:
         return False
 
     async def _filter(self, request: web.Request, ip: str) -> Tuple[bool, Optional[web.Response], Optional[bytes]]:
+        # Null-byte early rejection (path, query, key headers)
+        if "\x00" in request.path or "\x00" in (request.query_string or ""):
+            return False, self._err(request, 400, "Bad Request"), None
+        for hdr in ("Host", "User-Agent", "Content-Type", "X-Forwarded-For"):
+            val = request.headers.get(hdr, "")
+            if "\x00" in val:
+                return False, self._err(request, 400, "Bad Request"), None
+
         ua = request.headers.get("User-Agent", "")
         if not ua:
             is_new = self.rate_limiter.is_new_ip(ip)
@@ -1353,12 +1347,12 @@ class SentinelApp:
         if any(s in ua_lower for s in CFG.bad_ua_strings):
             return False, self._err(request, 403, "Forbidden"), None
 
-        request_id = request.get("request_id", "unknown")
+        request_id = request["request_id"]
         if CFG.enable_waf:
             combined = f"{request.path}\x00{request.query_string}"[:WAF_INSPECT_SIZE]
             waf_result = await async_waf_check(combined)
             if waf_result == "ERROR":
-                self.rate_limiter.force_ban(ip, request_id=request_id)
+                await self.rate_limiter.force_ban(ip, request_id=request_id)
                 audit_logger.warning("WAF_ERROR %s", ip,
                                      extra=self._audit_extra(request))
                 return False, self._err(request, 403, "WAF Error"), None
@@ -1379,42 +1373,27 @@ class SentinelApp:
                 async with WAF_SEM:
                     content_length = request.content_length
                     if content_length is not None and content_length > WAF_INSPECT_SIZE:
-                        self.rate_limiter.force_ban(ip, self.cfg.ban_max, request_id)
-                        audit_logger.warning("PAYLOAD_TOO_LARGE %s", ip,
-                                             extra=self._audit_extra(request))
-                        return False, self._err(request, 413, "Payload Too Large"), None
+                        # Body too large for WAF inspection – skip inspection, stream directly
+                        body_chunk = None
+                    else:
+                        try:
+                            body_chunk = await asyncio.wait_for(
+                                request.content.read(WAF_INSPECT_SIZE),
+                                timeout=CFG.waf_body_timeout,
+                            )
+                        except web.HTTPRequestEntityTooLarge:
+                            return False, self._err(request, 413, "Payload Too Large"), None
+                        except (asyncio.TimeoutError, TimeoutError):
+                            return False, await self._blackhole(request, ip, "Body Read Timeout"), None
+                        except (ClientPayloadError, ClientDisconnectedError, asyncio.IncompleteReadError,
+                                ConnectionResetError) as e:
+                            logger.debug("Client disconnected during body read: %s", e)
+                            return False, await self._blackhole(request, ip, "Client disconnect"), None
+                        except Exception as e:
+                            logger.error("Body read error: %s", e)
+                            return False, self._err(request, 400, "Bad Request: body read"), None
 
-                    try:
-                        body_chunk = await asyncio.wait_for(
-                            request.content.read(WAF_INSPECT_SIZE),
-                            timeout=CFG.waf_body_timeout,
-                        )
-                    except web.HTTPRequestEntityTooLarge:
-                        self.rate_limiter.force_ban(ip, self.cfg.ban_max, request_id)
-                        audit_logger.warning("PAYLOAD_TOO_LARGE %s", ip,
-                                             extra=self._audit_extra(request))
-                        return False, self._err(request, 413, "Payload Too Large"), None
-                    except (asyncio.TimeoutError, TimeoutError):
-                        return False, await self._blackhole(request, ip, "Body Read Timeout"), None
-                    except (ClientPayloadError, ClientDisconnectedError, asyncio.IncompleteReadError,
-                            ConnectionResetError) as e:
-                        logger.debug("Client disconnected during body read: %s", e)
-                        return False, await self._blackhole(request, ip, "Client disconnect"), None
-                    except Exception as e:
-                        logger.error("Body read error: %s", e)
-                        return False, self._err(request, 400, "Bad Request: body read"), None
-
-                    try:
-                        body_exceeded = not request.content.at_eof()
-                    except Exception:
-                        body_exceeded = False
-                    if body_chunk and body_exceeded:
-                        self.rate_limiter.force_ban(ip, self.cfg.ban_max, request_id)
-                        audit_logger.warning("PAYLOAD_TOO_LARGE (WAF limit) %s", ip,
-                                             extra=self._audit_extra(request))
-                        return False, self._err(request, 413, "Payload Too Large"), None
-
-                    if body_chunk:
+                    if body_chunk is not None:
                         try:
                             text = body_chunk[:WAF_INSPECT_SIZE].decode("utf-8", "ignore")
                         except UnicodeDecodeError:
@@ -1422,7 +1401,7 @@ class SentinelApp:
 
                         waf_result = await async_waf_check(text)
                         if waf_result == "ERROR":
-                            self.rate_limiter.force_ban(ip, request_id=request_id)
+                            await self.rate_limiter.force_ban(ip, request_id=request_id)
                             audit_logger.warning("WAF_ERROR_BODY %s", ip,
                                                  extra=self._audit_extra(request))
                             return False, self._err(request, 403, "WAF Error"), None
@@ -1434,11 +1413,15 @@ class SentinelApp:
                             return False, self._err(request, 403, "WAF Blocked"), None
 
                         if request.content_type and "application/json" in request.content_type:
-                            # CRITICAL FIX: JSON.parse + scan both off event loop.
                             loop = asyncio.get_running_loop()
-                            json_result = await loop.run_in_executor(
-                                waf_executor, _json_parse_and_scan, text,
-                            )
+                            try:
+                                json_result = await asyncio.wait_for(
+                                    loop.run_in_executor(waf_executor, _json_parse_and_scan, text),
+                                    timeout=WAF_REGEX_TIMEOUT,
+                                )
+                            except asyncio.TimeoutError:
+                                logger.error("JSON scan timeout – possible bomb")
+                                return False, self._err(request, 413, "JSON too large"), None
                             if json_result:
                                 async with self._metrics_lock:
                                     self._metrics["waf_hits"] += 1
@@ -1450,19 +1433,17 @@ class SentinelApp:
         return True, None, body_chunk
 
     # ------------------------------------------------------------------- #
-    #  Forwarding                                                           #
+    #  Forwarding                                                            #
     # ------------------------------------------------------------------- #
     async def _forward(self, request: web.Request, ip: str, body_chunk: Optional[bytes]) -> web.Response:
-        # SSRF-safe: backend rstrip, path lstrip, never embed absolute URI.
-        path = request.path_qs
-        url = CFG.backend_url.rstrip("/") + "/" + path.lstrip("/")
+        # SSRF‑safe URL: join base with trailing "/" to preserve backend path
+        url = urljoin(CFG.backend_url + "/", request.path_qs.lstrip("/"))
 
         headers = request.headers.copy()
         headers["Host"] = self.backend_host
-        self.filter_hop(headers)
-        headers["X-Request-ID"] = request.get("request_id", "unknown")
+        self.filter_hop_request(headers)
+        headers["X-Request-ID"] = request["request_id"]
 
-        # Rebuild XFF safely.  Truncate, cap list length.
         existing = headers.get("X-Forwarded-For", "")
         if len(existing) > XFF_MAX_LENGTH:
             existing = existing[-XFF_MAX_LENGTH:]
@@ -1485,6 +1466,7 @@ class SentinelApp:
 
         can_retry = request.method in ("GET", "HEAD")
         max_attempts = BACKEND_MAX_RETRIES + 1 if can_retry else 1
+        data = self._make_body_stream(body_chunk, request) if request.method in ("POST", "PUT", "PATCH", "DELETE") else None
 
         last_exception: Optional[Exception] = None
         async with self._active_lock:
@@ -1495,7 +1477,7 @@ class SentinelApp:
                     try:
                         async with self.session.request(
                             request.method, url, headers=headers,
-                            data=self._make_body_stream(body_chunk, request),
+                            data=data,
                             allow_redirects=False,
                             ssl=CFG.verify_ssl,
                         ) as resp:
@@ -1506,7 +1488,7 @@ class SentinelApp:
                                 self.cb.record_success()
 
                             backend_headers = resp.headers.copy()
-                            self.filter_hop(backend_headers)
+                            self.filter_hop_response(backend_headers)
                             backend_headers.pop("Server", None)
                             backend_headers.pop("X-Powered-By", None)
                             if CFG.server_header:
@@ -1565,7 +1547,7 @@ class SentinelApp:
 
 
 # --------------------------------------------------------------------------- #
-#  Application factory                                                         #
+#  Application factory                                                        #
 # --------------------------------------------------------------------------- #
 def create_app():
     sentinel = SentinelApp(CFG)
