@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sentinel Guard v24.3 – Last Stand Absolute (Fail‑Closed on overload)
+Sentinel Guard v24.5 – Last Stand Absolute (Windows Multi‑Process Fix)
 Production‑hardened, single‑file Python async anti‑DDoS layer‑7 wall.
 Works on Linux, Windows, macOS – no C‑extensions, no root required.
 Tested with: aiohttp >= 3.8, Python 3.9+.
@@ -12,9 +12,11 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import multiprocessing
 import os
 import queue
 import re
+import socket
 import sys
 import time
 import uuid
@@ -134,7 +136,7 @@ if sys.platform != "win32":
         pass
 
 # --------------------------------------------------------------------------- #
-#  Fast LRU + TTL cache (LRU eviction, NO background O(N) scans)               #
+#  Fast LRU + TTL cache (O(1) eviction, single‑pop instead of batch)           #
 # --------------------------------------------------------------------------- #
 class FastTTLCache:
     __slots__ = ("_data", "_maxsize", "_ttl")
@@ -157,11 +159,7 @@ class FastTTLCache:
         if key in self._data:
             del self._data[key]
         elif len(self._data) >= self._maxsize:
-            batch = max(1, self._maxsize // 1000)
-            for _ in range(batch):
-                if not self._data:
-                    break
-                self._data.pop(next(iter(self._data)), None)
+            self._data.pop(next(iter(self._data)), None)
         self._data[key] = (value, time.monotonic() + self._ttl)
 
     def __getitem__(self, key: str):
@@ -318,13 +316,18 @@ class Config:
 CFG = Config()
 
 # --------------------------------------------------------------------------- #
-#  Global resources                                                           #
+#  Global resources – lazy initialised in startup()                            #
 # --------------------------------------------------------------------------- #
 waf_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 listener: Optional[logging.handlers.QueueListener] = None
 audit_listener: Optional[logging.handlers.QueueListener] = None
 log_queue: "queue.Queue" = queue.Queue(maxsize=CFG.log_queue_maxsize)
 audit_log_queue: "queue.Queue" = queue.Queue(maxsize=CFG.log_queue_maxsize)
+
+# Semaphores MUST be created inside the running event loop (Python 3.9 compat)
+INBOUND_CONN_SEM: Optional[asyncio.Semaphore] = None
+WAF_SEM: Optional[asyncio.Semaphore] = None
+OUTBOUND_REQ_SEM: Optional[asyncio.Semaphore] = None
 
 # --------------------------------------------------------------------------- #
 #  FD accounting                                                              #
@@ -340,14 +343,10 @@ try:
 except Exception:
     MAX_SAFE_CONNS = MAX_SAFE_CONNS_LINUX
 
-INBOUND_CONN_SEM = asyncio.Semaphore(MAX_SAFE_CONNS)
-WAF_SEM = asyncio.Semaphore(CFG.backend_pool_size * WAF_SEM_MULTIPLIER)
-OUTBOUND_REQ_SEM = asyncio.Semaphore(CFG.backend_pool_size)
-
 BLOCK_HEADERS = {"Connection": "close", "Cache-Control": "no-store"}
 
 # --------------------------------------------------------------------------- #
-#  Logging – non‑blocking, drop when full                                      #
+#  Logging – non‑blocking, drop when full, Windows multi‑process safe          #
 # --------------------------------------------------------------------------- #
 class NonBlockingQueueHandler(logging.handlers.QueueHandler):
     def emit(self, record):
@@ -372,6 +371,14 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(log_entry)
 
 
+class SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except Exception:
+            pass
+
+
 queue_handler = NonBlockingQueueHandler(log_queue)
 logger = logging.getLogger("Sentinel")
 logger.setLevel(CFG.log_level)
@@ -391,7 +398,6 @@ _audit_formatter = JSONFormatter()
 # --------------------------------------------------------------------------- #
 _SQLI_PATTERNS = [
     re.compile(r"(?<![a-zA-Z0-9_])(sleep|benchmark|pg_sleep|waitfor)\s*\(", re.IGNORECASE),
-    # ReDoS‑safe UNION SELECT (handles both bare and ALL/DISTINCT variants)
     re.compile(r"\bunion\b[^a-zA-Z0-9_]{1,50}\b(?:all|distinct)\b[^a-zA-Z0-9_]{1,50}\bselect\b"
                r"|\bunion\b[^a-zA-Z0-9_]{1,50}\bselect\b", re.IGNORECASE),
     re.compile(r"\bselect\b[^a-zA-Z0-9_]{0,50}\bfrom\b", re.IGNORECASE),
@@ -516,7 +522,7 @@ def _json_scan(obj, max_depth: int = MAX_JSON_DEPTH, _count: Optional[List[int]]
 
 
 # --------------------------------------------------------------------------- #
-#  Rate limiter – sharded locks with fail‑fast timeout                         #
+#  Rate limiter – sharded locks with immediate fail‑fast for acquires           #
 # --------------------------------------------------------------------------- #
 class IPState:
     __slots__ = ("tokens", "last_time", "violations", "last_violation_time",
@@ -579,12 +585,9 @@ class RateLimiter:
     ) -> Tuple[bool, float, str]:
         key = self._get_rate_limit_key(ip)
         lock = self._get_shard_lock(key)
-
-        # FAIL‑FAST: no queuing – drop immediately if lock is contended
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=0.05)
-        except asyncio.TimeoutError:
+        if lock.locked():
             return False, 0.0, "system_overloaded"
+        await lock.acquire()
 
         try:
             now = time.monotonic()
@@ -628,10 +631,7 @@ class RateLimiter:
     async def dec_conn(self, ip: str):
         key = self._get_rate_limit_key(ip)
         lock = self._get_shard_lock(key)
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=0.05)
-        except asyncio.TimeoutError:
-            return
+        await lock.acquire()
         try:
             s = self._store.get(key)
             if s and s.active_conns > 0:
@@ -644,10 +644,7 @@ class RateLimiter:
         if duration is None:
             duration = self.cfg.ban_max
         lock = self._get_shard_lock(key)
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=0.05)
-        except asyncio.TimeoutError:
-            return
+        await lock.acquire()
         try:
             self._ban_store[key] = time.monotonic() + duration
             s = self._store.get(key)
@@ -677,7 +674,7 @@ class RateLimiter:
 
 
 # --------------------------------------------------------------------------- #
-#  Circuit breaker – fail‑fast transition lock                                 #
+#  Circuit breaker – immediate fail‑fast transition lock                       #
 # --------------------------------------------------------------------------- #
 class CircuitBreaker:
     def __init__(self, err_thr: int, window: float, probe_timeout: float):
@@ -720,10 +717,9 @@ class CircuitBreaker:
             return True
         if self._state == "OPEN":
             if now - self._last_failure >= self.probe_timeout:
-                try:
-                    await asyncio.wait_for(self._transition_lock.acquire(), timeout=0.01)
-                except asyncio.TimeoutError:
+                if self._transition_lock.locked():
                     return False
+                await self._transition_lock.acquire()
                 try:
                     if self._state == "OPEN" and not self._probe_in_progress:
                         self._probe_in_progress = True
@@ -735,10 +731,9 @@ class CircuitBreaker:
             return False
         if self._state == "HALF_OPEN":
             if now - self._probe_start_time > self.probe_timeout:
-                try:
-                    await asyncio.wait_for(self._transition_lock.acquire(), timeout=0.01)
-                except asyncio.TimeoutError:
+                if self._transition_lock.locked():
                     return False
+                await self._transition_lock.acquire()
                 try:
                     if self._state == "HALF_OPEN":
                         self._state = "OPEN"
@@ -751,30 +746,33 @@ class CircuitBreaker:
 
 
 # --------------------------------------------------------------------------- #
-#  SentinelApp – fail‑fast locks, fail‑closed on overload                      #
+#  SentinelApp – asyncio objects created in startup()                          #
 # --------------------------------------------------------------------------- #
 class SentinelApp:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.session: Optional[ClientSession] = None
-        self.rate_limiter = RateLimiter(cfg)
-        self.cb = CircuitBreaker(cfg.cb_error_threshold, cfg.cb_window, cfg.cb_probe_timeout)
+
+        # All asyncio objects are created in startup() – safe for multiprocessing
+        self.rate_limiter = None
+        self.cb = None
+        self._counter_locks = None
+        self._shutdown_event = None
+
         self._cleanup_task = None
         self._health_task = None
         self._backend_healthy = True
+
         self.ip_obj_cache = FastTTLCache(maxsize=IP_OBJ_CACHE_MAXSIZE, ttl=IP_OBJ_CACHE_TTL)
         self.ip_class_cache = FastTTLCache(maxsize=IP_CLASS_CACHE_MAXSIZE, ttl=IP_CLASS_CACHE_TTL)
         self.per_ip_endpoint_cache = FastTTLCache(maxsize=STATE_STORE_MAXSIZE, ttl=DEFAULT_PER_IP_ENDPOINT_TTL)
         self.global_per_ip_cache = FastTTLCache(maxsize=STATE_STORE_MAXSIZE, ttl=DEFAULT_GLOBAL_PER_IP_TTL)
         self.unique_query_cache = FastTTLCache(maxsize=UNIQUE_QUERY_CACHE_MAXSIZE, ttl=UNIQUE_QUERY_CACHE_TTL)
 
-        self._counter_locks: List[asyncio.Lock] = [asyncio.Lock() for _ in range(SHARD_LOCK_COUNT)]
-
         parsed_backend = urlparse(cfg.backend_url)
         self.backend_host = parsed_backend.hostname or "localhost"
         if parsed_backend.port:
             self.backend_host = f"{self.backend_host}:{parsed_backend.port}"
-        self._shutdown_event = asyncio.Event()
         self._active_inbound = 0
         self._active_outbound = 0
         self._metrics = {}
@@ -796,20 +794,37 @@ class SentinelApp:
         }
 
     # ------------------------------------------------------------------- #
-    #  Helper: attempt a lock with timeout (fail‑fast)                      #
+    #  Immediate lock helper – fail‑fast without spawning tasks              #
     # ------------------------------------------------------------------- #
-    async def _try_lock(self, lock: asyncio.Lock, timeout=0.05) -> bool:
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
+    async def _try_lock_immediate(self, lock: asyncio.Lock) -> bool:
+        if lock.locked():
             return False
+        await lock.acquire()
+        return True
 
     # ------------------------------------------------------------------- #
-    #  Lifecycle                                                            #
+    #  Lifecycle – asyncio primitives created here                          #
     # ------------------------------------------------------------------- #
     async def startup(self, app: web.Application):
         global waf_executor, listener, audit_listener
+        global INBOUND_CONN_SEM, WAF_SEM, OUTBOUND_REQ_SEM
+
+        # Create semaphores in the running event loop
+        if INBOUND_CONN_SEM is None:
+            INBOUND_CONN_SEM = asyncio.Semaphore(MAX_SAFE_CONNS)
+            WAF_SEM = asyncio.Semaphore(CFG.backend_pool_size * WAF_SEM_MULTIPLIER)
+            OUTBOUND_REQ_SEM = asyncio.Semaphore(CFG.backend_pool_size)
+
+        # Per‑process asyncio objects
+        if self._shutdown_event is None:
+            self._shutdown_event = asyncio.Event()
+        if self._counter_locks is None:
+            self._counter_locks = [asyncio.Lock() for _ in range(SHARD_LOCK_COUNT)]
+        if self.rate_limiter is None:
+            self.rate_limiter = RateLimiter(self.cfg)
+        if self.cb is None:
+            self.cb = CircuitBreaker(self.cfg.cb_error_threshold, self.cfg.cb_window, self.cfg.cb_probe_timeout)
+
         try:
             with open(CFG.log_file, "a"):
                 pass
@@ -824,7 +839,7 @@ class SentinelApp:
             )
 
         if listener is None:
-            fh = logging.handlers.RotatingFileHandler(
+            fh = SafeRotatingFileHandler(
                 CFG.log_file, maxBytes=100 * 1024 * 1024, backupCount=5, encoding="utf-8",
             )
             sh = logging.StreamHandler()
@@ -834,7 +849,7 @@ class SentinelApp:
             listener.start()
 
         if audit_listener is None:
-            afh = logging.handlers.RotatingFileHandler(
+            afh = SafeRotatingFileHandler(
                 CFG.audit_log_file, maxBytes=100 * 1024 * 1024, backupCount=5, encoding="utf-8",
             )
             afh.setFormatter(_audit_formatter)
@@ -894,7 +909,6 @@ class SentinelApp:
                 break
             except asyncio.TimeoutError:
                 pass
-            # No O(N) cache sweeps – lazy TTL eviction is enough
 
     async def _backend_health_check(self):
         if not self.cfg.health_check_enabled:
@@ -1043,15 +1057,14 @@ class SentinelApp:
         return True
 
     # ------------------------------------------------------------------- #
-    #  IP classification – FAIL‑CLOSED on lock timeout                      #
+    #  IP classification – FAIL‑CLOSED on lock contention                   #
     # ------------------------------------------------------------------- #
     async def _classify_ip(self, ip_str: str, ip_obj) -> str:
         if ip_str in self.ip_class_cache:
             return self.ip_class_cache[ip_str]
 
         lock = self._get_counter_lock(ip_str)
-        if not await self._try_lock(lock):
-            # System overloaded → assume hostile and drop via blackhole
+        if not await self._try_lock_immediate(lock):
             return "blacklist"
 
         try:
@@ -1196,7 +1209,7 @@ class SentinelApp:
         if request.path == "/health":
             health_key = f"health:{ip}"
             lock = self._get_counter_lock(health_key)
-            if not await self._try_lock(lock):
+            if not await self._try_lock_immediate(lock):
                 return self._err(request, 429, "Too Many Health Checks")
             try:
                 cnt = self.per_ip_endpoint_cache.get(health_key) or 0
@@ -1244,7 +1257,7 @@ class SentinelApp:
         # 8) Global per-IP
         global_ip_key = f"global:{ip}"
         lock = self._get_counter_lock(global_ip_key)
-        if not await self._try_lock(lock):
+        if not await self._try_lock_immediate(lock):
             return self._err(request, 429, "System Overloaded")
         try:
             global_ip_count = self.global_per_ip_cache.get(global_ip_key) or 0
@@ -1261,7 +1274,7 @@ class SentinelApp:
         if request.query_string:
             uq_key = f"uq:{ip}"
             lock = self._get_counter_lock(uq_key)
-            if not await self._try_lock(lock):
+            if not await self._try_lock_immediate(lock):
                 pass
             else:
                 try:
@@ -1285,7 +1298,7 @@ class SentinelApp:
         endpoint_hash = hash(request.path) & 0xFFFFFFFF
         endpoint_key = f"{ip}:{request.method}:{endpoint_hash}"
         lock = self._get_counter_lock(endpoint_key)
-        if not await self._try_lock(lock):
+        if not await self._try_lock_immediate(lock):
             return self._err(request, 429, "System Overloaded")
         try:
             count_entry = self.per_ip_endpoint_cache.get(endpoint_key)
@@ -1612,10 +1625,38 @@ def create_app():
     return app
 
 
+# --------------------------------------------------------------------------- #
+#  Multi‑process entrypoint – cross‑platform socket sharing                    #
+# --------------------------------------------------------------------------- #
+def run_worker(shared_sock):
+    """Entry point for each worker process."""
+    # Windows requires SelectorEventLoop for shared sockets (avoid WinError 87)
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    web.run_app(create_app(), sock=shared_sock, handle_signals=False,
+                keepalive_timeout=KEEPALIVE_TIMEOUT)
+
+
 if __name__ == "__main__":
-    handler_args = {
-        "keepalive_timeout": KEEPALIVE_TIMEOUT,
-        "slow_request_timeout": SLOW_REQUEST_TIMEOUT,
-    }
-    web.run_app(create_app(), host=CFG.listen_host, port=CFG.listen_port,
-                handle_signals=True, handler_args=handler_args)
+    multiprocessing.freeze_support()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
+    sock.bind((CFG.listen_host, CFG.listen_port))
+    sock.listen(os.cpu_count() * 1000)
+    sock.setblocking(False)
+
+    workers = os.cpu_count() or 4
+    processes = []
+    for _ in range(workers):
+        p = multiprocessing.Process(target=run_worker, args=(sock,))
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
