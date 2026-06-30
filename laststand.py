@@ -1354,6 +1354,38 @@ class SentinelApp:
         return ip_str
 
     @staticmethod
+    def _split_host_port(host_str: str) -> Tuple[str, str]:
+        """Parse `Host` header into (hostname, port_str).
+
+        Handles:
+          - 'example.com'      -> ('example.com', '')
+          - 'example.com:443'  -> ('example.com', '443')
+          - '127.0.0.1:9999'   -> ('127.0.0.1', '9999')
+          - '[::1]:9999'       -> ('::1', '9999')
+          - '[::1]'            -> ('::1', '')
+          - '::1'              -> ('::1', '')  (no port in unbracketed IPv6)
+
+        Fixes false-positive 400 when legit clients send `Host: ip:port`
+        and listen_host is set to the bare IP — v29 compared the entire
+        header, so `Host: 127.0.0.1:9999` failed equality vs `127.0.0.1`.
+        """
+        if not host_str:
+            return ("", "")
+        if host_str.startswith("["):
+            idx = host_str.find("]")
+            if idx != -1:
+                h = host_str[1:idx]
+                p = host_str[idx + 2:] if (
+                    len(host_str) > idx + 1 and host_str[idx + 1] == ":"
+                ) else ""
+                return (h, p)
+            return (host_str[1:], "")
+        if host_str.count(":") == 1:
+            h, p = host_str.split(":", 1)
+            return (h, p)
+        return (host_str, "")
+
+    @staticmethod
     def _ip_matches(ip_str: str, networks: Iterable) -> bool:
         try:
             ip = ipaddress.ip_address(SentinelApp._normalize_ip(ip_str))
@@ -1489,14 +1521,23 @@ class SentinelApp:
 
         host_hdr = request.headers.get("Host", "")
         if not host_hdr or len(host_hdr) > 256 or len(host_hdr) < 3 \
-                or any(c in host_hdr for c in " \t\r"):
+                or any(c in host_hdr for c in " \t\r\n"):
             return self._err(request, 400, "Invalid Host header")
         host_lc = host_hdr.lower()
+        # FIX-HOST: compare only the hostname portion of the Host header.
+        # Real clients always send `Host: domain:port`. v29 did a literal
+        # string equality check so `Host: 127.0.0.1:9999` was rejected vs
+        # listen_host `127.0.0.1`. Now we strip the port + IPv6 brackets.
+        host_no_port, _port = self._split_host_port(host_lc)
+        listen_lc = (self.cfg.listen_host or "").lower()
+        listen_stripped = listen_lc.strip("[]") if listen_lc else ""
         if self.cfg.allowed_hosts:
-            if not any(host_lc == h or host_lc.endswith("." + h) for h in self.cfg.allowed_hosts):
+            if not any(host_no_port == h or host_no_port.endswith("." + h)
+                       for h in self.cfg.allowed_hosts):
                 return self._err(request, 400, "Host not allowed")
-        elif self.cfg.listen_host not in ("0.0.0.0", "::"):
-            if host_lc not in (self.cfg.listen_host, "localhost", "127.0.0.1", "[::1]"):
+        elif listen_lc not in ("0.0.0.0", "::"):
+            if host_no_port not in (listen_lc, listen_stripped,
+                                     "localhost", "127.0.0.1", "::1", "[::1]"):
                 return self._err(request, 400, "Invalid Host header")
         return None
 
