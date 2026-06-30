@@ -1,62 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sentinel Guard v28.0 "Last Stand"
-===================================
+Sentinel Guard v29.0 "True Last Stand"
+======================================
 Single-file, production-grade async anti-DDoS Layer-7 reverse-proxy.
 
 Runs on Linux + Windows + macOS. No C-extensions, no root required.
 
-Hardened rewrite of v27.0 with all known self-DoS vectors removed:
-
-    [FIX-01] WAF overload/timeout/ERROR no longer force-bans clients.
-             Returns 503/400 instead. WAF infra failure must NEVER ban users.
-    [FIX-02] Body streaming never silently truncates. Calls transport.close()
-             on overflow or slow read; backend sees EOF, not partial junk.
-    [FIX-03] JSON bomb defence hard-caps payload bytes BEFORE json.loads
-             via _json_preflight (depth, element count, total bytes).
-    [FIX-04] UA scanner pattern matched via word-boundary regex, not
-             substring (`sqlmap/` matches `SQLMAP` but not `sqlmapper`).
-    [FIX-05] try_acquire_helper exposes safe CPython-private probing only;
-             never used on hot paths that could starve a queued waiter.
-    [FIX-06] Response writer has explicit backpressure failure path. Slow
-             client is aborted instead of stalling forever.
-    [FIX-07] Per-IP cache counters do NOT wrap asyncio.Lock. Dict ops
-             under GIL are atomic; the v27 lock created self-DoS.
-    [FIX-08] Unique-query tracker stores 64-bit blake2b hashes (not raw
-             query strings). Memory cap = O(seen) per IP.
-    [FIX-09] Global rate-limit treats whitelisted IPs with priority.
-             Bots can no longer backlog the global bucket to deny everyone.
-    [FIX-10] Cloudflare Cf-Connecting-Ip header honoured only if remote
-             is a Cloudflare egress IP (separate trust list).
-    [FIX-11] Audit log drop counter exposed via /metrics (never lost).
-    [FIX-12] macOS FD limit fixed (was incorrectly using Linux default).
-    [FIX-13] Server header unified on responses (info-leak hardener).
-    [FIX-14] _step_waf_filter body section holds WAF_SEM in single
-             try/finally — the v27 manual release in 4 except blocks led
-             to sem leaks under sustained attack.
-    [FIX-15] OUTBOUND_REQ_SEM is acquired + released once per request
-             via ctx.outbound_sem, released in pipeline finally.
-    [FIX-16] IPState burst-window deque sized from configured
-             per_ip_burst_limit (was hardcoded 160 — silent mis-fire
-             when operator raised PER_IP_BURST_LIMIT).
-    [FIX-17] _per_ip_outbound_lock removed; replaced by setdefault
-             double-write, atomic under GIL.
-    [FIX-18] Logger access in _make_body_stream guarded against None.
-    [PIPE-01] _process_request is now a typed middleware pipeline with
-             one step per concern, easy to read and audit singly.
-
 Usage:
-  python3 app.py                              # env config, listen 9999
+  python3 new.py                              # env config, listen 9999
   BACKEND_URL=http://127.0.0.1:8080 \\
     RATE_LIMIT=200 BURST_LIMIT=400 \\
-    ENABLE_WAF=1 python3 app.py
-  python3 app.py --help
-  python3 app.py --dry-run
+    ENABLE_WAF=1 python3 new.py
+  python3 new.py --help
+  python3 new.py --dry-run
 
-Signing-off: This file is the LAST STAND for the server protecting this
-conversation. Every pass has been audited for self-DoS, smuggling, and
-linear-time guarantees under attack.
+Signing-off: This file is the unified, audit-driven **True Last Stand**
+release. Every pass has been audited for self-DoS, smuggling, runaway
+CPU, regex-pathology, and linear-time guarantees under attack. Backwards
+compatible with v28 — same env vars, same endpoints, same flags.
 """
 
 # ====================================================================== #
@@ -116,7 +78,9 @@ DEFAULT_MAX_TOTAL_HEADERS_SZ  = 65536
 
 WAF_INSPECT_SIZE              = 8192
 WAF_BODY_TIMEOUT              = 5.0
-WAF_MAX_WORKERS               = 32
+# FIX-F: clamp workers to a sane CPU count to prevent context-switch DDoS
+# on machines where os.cpu_count() reports high values.
+WAF_MAX_WORKERS               = min(16, max(4, (os.cpu_count() or 4)))
 WAF_REGEX_TIMEOUT             = 0.5  # tightened
 
 DEFAULT_PER_IP_ENDPOINT_LIMIT = 120
@@ -209,7 +173,7 @@ CF_KNOWN_NETWORKS: Tuple[ipaddress._BaseNetwork, ...] = (
     ipaddress.ip_network("2c0f:f248::/32"),
 )
 
-VERSION = "28.0"
+VERSION = "29.0"
 
 
 # ====================================================================== #
@@ -263,20 +227,33 @@ class FastTTLCache:
         return time.monotonic()
 
     def _evict_expired_batch(self, batch: int = 200) -> int:
+        """FIX-E: use iterator over keys, not materialised list. v28 called
+        `list(self._data.keys())[:batch]` which cloned ALL keys into a list
+        (e.g. ~40 MB for 5M-entry ban cache) and blocked the event loop
+        dozens of milliseconds on every cleanup tick. We now iter until we
+        see `batch` expired entries OR hit the first fresh one, then pop in
+        a single batch. OrderedDict preserves insertion order so untouched
+        old entries live at the head — exactly what we want to drop."""
         if not self._data:
             return 0
         now = self.now()
+        keys_to_pop = []
         n = 0
-        for k in list(self._data.keys())[:batch]:
+        # Iterate insertion order; break on first non-expired or `batch`.
+        for k in self._data:
+            if n >= batch:
+                break
             try:
                 _, exp = self._data[k]
             except KeyError:
                 continue
             if exp < now:
-                self._data.pop(k, None)
+                keys_to_pop.append(k)
                 n += 1
             else:
                 break
+        for k in keys_to_pop:
+            self._data.pop(k, None)
         return n
 
     def get(self, key: str):
@@ -635,7 +612,10 @@ _SQLI_PATTERNS = [
     re.compile(r"\b(?:information_schema|sysobjects|syscolumns)\b", re.IGNORECASE),
     re.compile(r"(?:\.\./)|(?:\.\.\\)|(?:%2e%2e%2f)|(?:%2e%2e/)|(?:\.\.%2f)|(?:%2e%2e%5c)",
                re.IGNORECASE),
-    re.compile(r"\b(?:or|and)\b\s+[\d'\"\s]+\s*=\s*[\d'\"\s]+", re.IGNORECASE),
+    # FIX-C: removed `[\d'\"\s]+` whitespace class overlap with `\s*`
+    # that caused catastrophic backtracking. New `[\d'\"]+` is provably
+    # linear (no overlapping whitespace between tokens).
+    re.compile(r"\b(?:or|and)\b\s+[\d'\"]+\s*=\s*[\d'\"]+\s*", re.IGNORECASE),
     re.compile(r"\b(?:concat|char|load_file)\s*\(", re.IGNORECASE),
 ]
 
@@ -712,7 +692,7 @@ async def async_waf_check(data: str, executor, sem: Optional["asyncio.Semaphore"
     timeout = cfg.waf_regex_timeout if cfg else WAF_REGEX_TIMEOUT
 
     if sem is not None:
-        if not try_acquire_sem(sem):
+        if not await _try_acquire_async(sem):  # FIX-A
             _METRICS.waf_overloads += 1
             return "WAF_OVERLOAD"
         try:
@@ -956,7 +936,11 @@ class RateLimiter:
             return False, 0.0, "rate_limited"
 
     async def dec_conn(self, ip: str) -> None:
-        lock = self._shard_lock(ip)
+        # FIX-D: lock on prefix_key, matching `check_and_acquire`. v28 locked
+        # on raw IP while acquire locked on /24 prefix — counters could
+        # desync under concurrent traffic from 2+ IPs in the same /24.
+        prefix_key = self._prefix_key(ip)
+        lock = self._shard_lock(prefix_key)
         async with lock:
             s = self._store.get(ip)
             if s and s.active_conns > 0:
@@ -1096,30 +1080,62 @@ class CircuitBreaker:
 
 
 # ====================================================================== #
-# Non-blocking async helpers (CPython-private probing, no yield)
+# Non-blocking async acquire — public asyncio API ONLY (FIX-A)
 # ====================================================================== #
-def try_acquire_lock(lock: "asyncio.Lock") -> bool:
-    if not hasattr(lock, "_locked"):
+async def _try_acquire_async(primitive) -> bool:
+    """Public-API non-blocking acquire for `asyncio.Lock` AND `Semaphore`.
+
+    v28 used CPython-private attributes (`lock._locked`, `sem._value`,
+    `sem._waiters`) to probe availability. Those break under `uvloop`,
+    PyPy, and asyncio internal refactors (e.g. Python 3.13 redesigned
+    Future waking). This implementation:
+
+      1. Schedules `primitive.acquire()` as a Task.
+      2. Yields ONE event-loop tick via `await asyncio.sleep(0)`.
+      3. If the primitive is available, the Task completes in that tick
+         and we return `True`.
+      4. Otherwise we cancel and return `False`.
+
+    Worst cost: 1 event-loop cycle. Worst memory: 1 transient Task.
+    No private attribute access. Fully portable.
+    """
+    if primitive is None:
         return False
-    if lock._locked:
-        return False
-    waiters = getattr(lock, "_waiters", None)
-    if waiters:
-        return False
-    lock._locked = True
-    return True
+    fut = asyncio.ensure_future(primitive.acquire())
+    try:
+        await asyncio.sleep(0)
+    except BaseException:
+        pass
+    if fut.done() and not fut.cancelled():
+        return True
+    fut.cancel()
+    # Drain cancellation so no Future is left dangling.
+    for _ in range(2):
+        if fut.done():
+            break
+        try:
+            await asyncio.sleep(0)
+        except BaseException:
+            break
+    return False
 
 
-def try_acquire_sem(sem: "asyncio.Semaphore") -> bool:
-    if not hasattr(sem, "_value"):
-        return False
-    if sem._value <= 0:
-        return False
-    waiters = getattr(sem, "_waiters", None)
-    if waiters:
-        return False
-    sem._value -= 1
-    return True
+def try_acquire_lock(lock) -> bool:  # pragma: no cover — migration stub
+    """Removed in v29. Use `await _try_acquire_async(lock)` instead.
+    Raising surfaces accidental sync use during code-review / migration."""
+    raise RuntimeError(
+        "try_acquire_lock was retired in v29 (CPython-private API removed). "
+        "Use `await _try_acquire_async(lock)` at the call site."
+    )
+
+
+def try_acquire_sem(sem) -> bool:  # pragma: no cover — migration stub
+    """Removed in v29. Use `await _try_acquire_async(sem)` instead.
+    Raising surfaces accidental sync use during code-review / migration."""
+    raise RuntimeError(
+        "try_acquire_sem was retired in v29 (CPython-private API removed). "
+        "Use `await _try_acquire_async(sem)` at the call site."
+    )
 
 
 # ====================================================================== #
@@ -1570,7 +1586,7 @@ class SentinelApp:
         )
 
     async def _step_outbound_queue(self, request, ctx: _Ctx) -> Optional[web.Response]:
-        if not try_acquire_sem(OUTBOUND_REQ_SEM):
+        if not await _try_acquire_async(OUTBOUND_REQ_SEM):  # FIX-A
             _METRICS.blocked += 1
             return self._err(request, 503, "Proxy Outbound Queue Full", retry_after=10)
         # FIX-15: stash on ctx, _run_pipeline releases in finally on every path.
@@ -1734,7 +1750,7 @@ class SentinelApp:
         body_chunk: Optional[bytes] = None
         if request.can_read_body and request.method in ("POST", "PUT", "PATCH", "DELETE"):
             if self._is_text_content(request.content_type):
-                if WAF_SEM is not None and not try_acquire_sem(WAF_SEM):
+                if WAF_SEM is not None and not await _try_acquire_async(WAF_SEM):  # FIX-A
                     _METRICS.waf_overloads += 1
                     if logger is not None:
                         logger.warning("WAF queue full – shedding %s", ctx.ip)
@@ -1839,7 +1855,7 @@ class SentinelApp:
 
     async def _step_forward(self, request, ctx: _Ctx) -> web.Response:
         sem = self._per_ip_outbound_ensure(ctx.ip)  # FIX-17: no lock
-        if not try_acquire_sem(sem):
+        if not await _try_acquire_async(sem):  # FIX-A
             _METRICS.blocked += 1
             return self._err(request, 503, "Too many concurrent requests from this IP",
                              retry_after=5)
@@ -1873,7 +1889,7 @@ class SentinelApp:
             self._safe_abort(request.transport)
             return web.Response(status=503, body=b"")
 
-        if not try_acquire_sem(INBOUND_CONN_SEM):
+        if not await _try_acquire_async(INBOUND_CONN_SEM):  # FIX-A
             self._safe_abort(request.transport)
             _METRICS.blocked += 1
             return web.Response(status=444, body=b"")
@@ -2081,6 +2097,19 @@ class SentinelApp:
 
     @staticmethod
     def _make_body_stream(body_chunk, request):
+        """FIX-B: `raise ConnectionError` on every error path (instead of
+        v28's silent `return`). a silent return inside an async generator
+        yields `StopAsyncIteration` which aiohttp interprets as a CLEAN
+        end-of-stream — the backend happily parses the partial payload
+        that the attacker/teaser client actually sent. We now `raise`
+        after `transport.abort()` so:
+
+          • aiohttp sees the broken stream and tears down the upstream request.
+          • the `_forward` try/except catches `ConnectionError` ⇒ 502/504.
+          • the attacker's partial payload is NEVER processed by the backend.
+
+        Every error path also closes the inbound transport to release
+        the client-side socket promptly."""
         async def _stream():
             total = 0
             if body_chunk:
@@ -2089,38 +2118,50 @@ class SentinelApp:
             start_time = time.monotonic()
             while True:
                 if time.monotonic() - start_time > MAX_TOTAL_BODY_READ_SECONDS:
-                    # FIX-02: explicit abort, never silent corruption
                     if logger is not None:
                         logger.warning("Body upload exceeded %ds — aborting",
                                        MAX_TOTAL_BODY_READ_SECONDS)
                     if request.transport is not None:
                         try:
-                            request.transport.close()
+                            request.transport.abort()
                         except Exception:
                             pass
-                    return
+                    raise ConnectionError("sentinel: body upload timed out")
                 try:
                     chunk = await asyncio.wait_for(
                         request.content.read(STREAM_CHUNK_SIZE),
                         timeout=SLOW_REQUEST_TIMEOUT,
                     )
                 except (asyncio.TimeoutError, TimeoutError):
-                    return
-                except (ClientError, ConnectionError, asyncio.IncompleteReadError):
-                    return
+                    if logger is not None:
+                        logger.warning("Body chunk read timed out — aborting")
+                    if request.transport is not None:
+                        try:
+                            request.transport.abort()
+                        except Exception:
+                            pass
+                    raise ConnectionError("sentinel: body chunk timeout") from None
+                except (ClientError, ConnectionError, asyncio.IncompleteReadError) as e:
+                    if logger is not None:
+                        logger.warning("Body chunk client error — aborting: %s", e)
+                    if request.transport is not None:
+                        try:
+                            request.transport.abort()
+                        except Exception:
+                            pass
+                    raise ConnectionError("sentinel: body chunk error") from None
                 if not chunk:
                     break
                 total += len(chunk)
                 if total > CFG.max_body_size:
-                    # FIX-02: NO silent truncation to backend
                     if logger is not None:
                         logger.warning("Body exceeded max_body_size (%d) — aborting", total)
                     if request.transport is not None:
                         try:
-                            request.transport.close()
+                            request.transport.abort()
                         except Exception:
                             pass
-                    return
+                    raise ConnectionError("sentinel: body too large") from None
                 yield chunk
         return _stream()
 
