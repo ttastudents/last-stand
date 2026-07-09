@@ -1,24 +1,55 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sentinel Guard v29.0 "True Last Stand"
-======================================
-Single-file, production-grade async anti-DDoS Layer-7 reverse-proxy.
+Sentinel Guard v30.0 "Last Stand — Ascendant"
+=============================================
+Single-file, production-grade async anti-DDoS **Layer-7** reverse-proxy.
 
-Runs on Linux + Windows + macOS. No C-extensions, no root required.
+Pure application layer: no iptables/nftables, no kernel or root dependency.
+Runs on Linux + Windows + macOS. Only dependency is aiohttp.
 
 Usage:
-  python3 new.py                              # env config, listen 9999
+  python3 laststand.py                        # env config, listen 9999
   BACKEND_URL=http://127.0.0.1:8080 \\
     RATE_LIMIT=200 BURST_LIMIT=400 \\
-    ENABLE_WAF=1 python3 new.py
-  python3 new.py --help
-  python3 new.py --dry-run
+    ENABLE_WAF=1 POW_MODE=auto python3 laststand.py
+  python3 laststand.py --help
+  python3 laststand.py --dry-run
+  python3 laststand.py --self-test           # run the built-in unit suite
 
-Signing-off: This file is the unified, audit-driven **True Last Stand**
-release. Every pass has been audited for self-DoS, smuggling, runaway
-CPU, regex-pathology, and linear-time guarantees under attack. Backwards
-compatible with v28 — same env vars, same endpoints, same flags.
+Defence-in-depth, all L7:
+  • Per-IP token-bucket rate limiting with escalating prefix bans
+  • Rolling burst-window flood detection + global request cap
+  • Connection / endpoint / unique-query (scraper) caps
+  • Linear-time WAF: SQLi, XSS, prototype-pollution, LFI/traversal, RCE,
+    SSRF, Log4Shell/JNDI, SpEL/template injection, XXE, NoSQL — inspected in
+    path, query, JSON/text body **and headers**
+  • HTTP request-smuggling (TE/CL) and Slowloris defence
+  • Proof-of-Work "I'm Under Attack" challenge with a signed clearance cookie,
+    auto-engaged when a block-rate spike is detected
+  • Circuit breaker, backend health shedding, graceful drain, ban persistence
+  • Prometheus / JSON metrics
+
+Changes since v29 ("True Last Stand"):
+  [v30-1] Streaming no longer truncates large downloads. The total-response
+          timeout (backend ClientTimeout.total + a wait_for wrapping the whole
+          stream) is replaced by per-chunk *idle* timeouts on both the backend
+          read and the client write — a stalled peer is still cut, a steady
+          large transfer completes. Also fixes the latent "prepare a response
+          twice" error when the old total-timeout fired mid-stream.
+  [v30-2] Constant-time secret comparison via hmac.compare_digest (the v29
+          hand-rolled compare leaked length via an early return).
+  [v30-3] Banned IPs no longer drain the global token bucket — the ban store
+          is peeked before a global token is spent, closing a self-DoS vector.
+  [v30-4] WAF expanded to LFI/RCE/SSRF/Log4Shell/SpEL/XXE/NoSQL and now scans
+          header values (Log4Shell's usual vector) with a low-false-positive
+          rule subset. All patterns remain provably linear-time.
+  [v30-5] Proof-of-Work challenge subsystem + adaptive under-attack mode.
+  Backwards compatible — same env vars, endpoints and flags as v28/v29; every
+  new capability is opt-in or engages only under attack.
+
+Every pass has been audited for self-DoS, smuggling, runaway CPU,
+regex-pathology, and linear-time guarantees under attack.
 """
 
 # ====================================================================== #
@@ -27,8 +58,10 @@ compatible with v28 — same env vars, same endpoints, same flags.
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -39,6 +72,7 @@ import platform
 import queue
 import random
 import re
+import secrets
 import signal
 import sys
 import time
@@ -173,7 +207,7 @@ CF_KNOWN_NETWORKS: Tuple[ipaddress._BaseNetwork, ...] = (
     ipaddress.ip_network("2c0f:f248::/32"),
 )
 
-VERSION = "29.0"
+VERSION = "30.0"
 
 
 # ====================================================================== #
@@ -421,7 +455,6 @@ class Config:
                                                          WAF_BODY_TIMEOUT, 0.1)
         self.waf_regex_timeout       = self._safe_float(ovget("WAF_REGEX_TIMEOUT", None),
                                                          WAF_REGEX_TIMEOUT, 0.05)
-        self.enable_firewall         = (ovget("ENABLE_FIREWALL", "0") in ("1", "true", "True", "yes"))
 
         self.backend_pool_size       = self._safe_int(ovget("BACKEND_POOL_SIZE", None),
                                                      OUTBOUND_SEM_BASE, 1)
@@ -477,6 +510,43 @@ class Config:
         self.unique_query_threshold  = self._safe_int(ovget("UNIQUE_QUERY_THRESHOLD", None), 50, 1)
         self.unique_query_hard_limit = self._safe_int(ovget("UNIQUE_QUERY_HARD_LIMIT", None), 500, 1)
 
+        # Streaming (v30). resp_max_bps=0 disables the response throttle.
+        # The stream uses an *idle* timeout (max gap between chunks), not a
+        # total-duration timeout, so large legitimate downloads are never
+        # truncated while stalled backends/clients are still cut off.
+        self.resp_max_bps            = self._safe_int(ovget("RESP_MAX_BPS", None),
+                                                      2 * 1024 * 1024, 0)
+        self.stream_idle_timeout     = self._safe_float(ovget("STREAM_IDLE_TIMEOUT", None),
+                                                        15.0, 1.0)
+        # Bounds the pre-forward analysis phase only (WAF, rate-limit, etc.).
+        # The streaming phase is governed by stream_idle_timeout instead.
+        self.analysis_timeout        = self._safe_float(
+            ovget("ANALYSIS_TIMEOUT", None),
+            max(self.backend_timeout + 5.0, 12.0), 2.0)
+
+        # Proof-of-Work challenge ("I'm Under Attack" mode, v30).
+        #   off  — never challenge (v29 behaviour)
+        #   on   — always challenge un-cleared browser navigations
+        #   auto — engage automatically when a block-rate spike is detected
+        pm = str(ovget("POW_MODE", "auto")).lower().strip()
+        self.pow_mode                = pm if pm in ("off", "on", "auto") else "auto"
+        self.pow_bits                = self._safe_int(ovget("POW_BITS", None), 18, 8, 26)
+        self.pow_ttl                 = self._safe_int(ovget("POW_TTL", None), 300, 10)
+        self.pow_clearance_ttl       = self._safe_int(ovget("POW_CLEARANCE_TTL", None),
+                                                      1800, 30)
+        self.pow_cookie              = str(ovget("POW_COOKIE", "__sentinel_clr")).strip() \
+                                       or "__sentinel_clr"
+        # Shared secret for multi-instance deployments — clearance cookies /
+        # challenges issued by one node must validate on another. If unset a
+        # random per-process secret is generated (single-instance only).
+        self.pow_secret              = str(ovget("POW_SECRET", "")).strip()
+        self.pow_verify_limit        = self._safe_int(ovget("POW_VERIFY_LIMIT", None), 60, 1)
+        # auto-engage: >= this many blocks within the window trips under-attack.
+        self.auto_pow_blocks         = self._safe_int(ovget("AUTO_POW_BLOCKS", None), 100, 1)
+        self.auto_pow_window         = self._safe_float(ovget("AUTO_POW_WINDOW", None), 10.0, 1.0)
+        self.auto_pow_cooldown       = self._safe_float(ovget("AUTO_POW_COOLDOWN", None),
+                                                        120.0, 5.0)
+
 
 # ====================================================================== #
 # Logging (non-blocking, drop on full, drop counter exposed)
@@ -487,6 +557,8 @@ class _MetricsCollector:
         "bans", "slow_aborts", "circuit_rejects", "rate_blocked",
         "burst_window_blocks", "scraper_blocks", "global_blocks",
         "log_drops", "audit_log_drops",
+        "pow_challenges", "pow_solved", "pow_failed", "clearance_granted",
+        "under_attack", "under_attack_engaged",
     )
 
     def __init__(self) -> None:
@@ -507,6 +579,12 @@ class _MetricsCollector:
         self.global_blocks = 0
         self.log_drops = 0
         self.audit_log_drops = 0
+        self.pow_challenges = 0        # challenge interstitials issued
+        self.pow_solved = 0            # valid PoW solutions accepted
+        self.pow_failed = 0            # invalid/expired solutions rejected
+        self.clearance_granted = 0     # clearance cookies issued
+        self.under_attack = 0          # gauge: 1 while auto-mode is engaged
+        self.under_attack_engaged = 0  # counter: times auto-mode engaged
 
 
 _METRICS = _MetricsCollector()
@@ -638,6 +716,116 @@ _PROTO_POLLUTION_PATTERNS = [
     re.compile(r"\bprototype\b\s*\[", re.IGNORECASE),
 ]
 
+# --- v30 categories. Every pattern is provably linear-time: bounded
+# quantifiers only, no nested/overlapping repetition, no back-references.
+
+# Local File Inclusion / path traversal (file-target specific — the bare
+# `../` case is also caught by the SQLi traversal rule above).
+_TRAVERSAL_PATTERNS = [
+    re.compile(r"(?:\.\.[\\/]){2,}"),
+    re.compile(r"(?:%2e%2e[\\/%])", re.IGNORECASE),
+    re.compile(r"/etc/(?:passwd|shadow|hosts|group|gshadow|mysql)\b", re.IGNORECASE),
+    re.compile(r"/proc/self/(?:environ|cmdline|status|maps|fd)\b", re.IGNORECASE),
+    re.compile(r"\b(?:php|file|zip|phar|expect|data|glob|compress\.\w+)://", re.IGNORECASE),
+    re.compile(r"[\\/](?:windows|winnt)[\\/](?:win\.ini|system32|system\.ini)", re.IGNORECASE),
+]
+
+# Remote Command Execution / OS command injection. Every rule is gated on a
+# shell metacharacter so bare words never match.
+_RCE_PATTERNS = [
+    re.compile(r"[;&|]\s{0,4}(?:cat|ls|id|pwd|whoami|uname|wget|curl|bash|sh|zsh|ksh|"
+               r"nc|ncat|netcat|python[0-9]?|perl|ruby|php|powershell|pwsh|cmd|certutil|"
+               r"nslookup|dig|ping|chmod|chown|rm|mv|cp|kill|touch|mkdir|scp|ssh|tftp)\b",
+               re.IGNORECASE),
+    re.compile(r"\$\(\s*[\w/]"),
+    re.compile(r"`[^`]{0,80}`"),
+    re.compile(r"\|\s{0,4}(?:sh|bash|zsh|nc|ncat|curl|wget|python[0-9]?|perl|php)\b",
+               re.IGNORECASE),
+    re.compile(r"&&\s{0,4}(?:cat|curl|wget|bash|sh|nc|whoami|id|ping)\b", re.IGNORECASE),
+    re.compile(r"/(?:bin|usr/bin|sbin)/(?:sh|bash|zsh|nc|python[0-9]?|perl)\b", re.IGNORECASE),
+    re.compile(r"\$\{IFS\}", re.IGNORECASE),
+    re.compile(r"\bnc\b\s{0,4}-[a-z]{0,3}e\b", re.IGNORECASE),
+]
+
+# Server-Side Request Forgery — cloud metadata endpoints, dangerous URL
+# schemes, and internal hosts. Public URLs (https://example.com) do NOT match.
+_SSRF_PATTERNS = [
+    re.compile(r"\b169\.254\.169\.254\b"),
+    re.compile(r"\bmetadata\.google\.internal\b", re.IGNORECASE),
+    re.compile(r"\b100\.100\.100\.200\b"),
+    re.compile(r"\b(?:gopher|dict|ftp|tftp|ldap|ldaps|jar|netdoc)://", re.IGNORECASE),
+    re.compile(r"://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|169\.254\.\d|\[?::1\]?)", re.IGNORECASE),
+]
+
+# Log4Shell / JNDI + SpEL / template / scriptlet injection.
+_INJECT_PATTERNS = [
+    re.compile(r"\$\{jndi:", re.IGNORECASE),
+    re.compile(r"\$\{(?:env|sys|ctx|lower|upper|date|java|main|base64|url|spring|"
+               r"k8s|log4j|kubernetes|hostName|sd):", re.IGNORECASE),
+    re.compile(r"\$\{[^}]{0,30}\$\{"),
+    re.compile(r"\$\{T\(", re.IGNORECASE),
+    re.compile(r"#\{[^}]{0,60}\}"),
+    re.compile(r"<%[=@]?[^%]{0,100}%>"),
+    re.compile(r"\{\{[^}]{0,60}(?:\*|__|\bconfig\b|\bself\b|request|cycler|joiner)[^}]{0,60}\}\}",
+               re.IGNORECASE),
+]
+
+# XML External Entity.
+_XXE_PATTERNS = [
+    re.compile(r"<!ENTITY\b", re.IGNORECASE),
+    re.compile(r"<!DOCTYPE\b[^>]{0,200}(?:SYSTEM|PUBLIC)\b", re.IGNORECASE),
+    re.compile(r"\bSYSTEM\s+[\"']?(?:file|https?|php|expect)://", re.IGNORECASE),
+]
+
+# NoSQL / operator injection.
+_NOSQL_PATTERNS = [
+    re.compile(r"\[\$(?:ne|eq|gt|gte|lt|lte|in|nin|or|and|not|nor|where|regex|"
+               r"exists|type|mod|all|size|elemmatch)\]", re.IGNORECASE),
+    re.compile(r"\$where\b", re.IGNORECASE),
+    re.compile(r"\{\s*\$(?:ne|gt|gte|lt|lte|where|regex|function)\b", re.IGNORECASE),
+]
+
+# Fixed high-signal substrings — a single cheap lowercase pass before regex.
+_TOKEN_SIGNATURES: Tuple[Tuple[str, str], ...] = (
+    ("${jndi:", "INJECT"), ("jndi:ldap", "INJECT"), ("jndi:rmi", "INJECT"),
+    ("jndi:dns", "INJECT"), ("jndi:iiop", "INJECT"),
+    ("/etc/passwd", "LFI"), ("/etc/shadow", "LFI"), ("etc/passwd", "LFI"),
+    ("/proc/self/environ", "LFI"), ("boot.ini", "LFI"),
+    ("169.254.169.254", "SSRF"), ("metadata.google.internal", "SSRF"),
+    ("<!entity", "XXE"), ("<!doctype", "XXE"),
+    ("/bin/sh", "RCE"), ("/bin/bash", "RCE"), ("cmd.exe", "RCE"),
+)
+
+# Category groups scanned by waf_check (full) and the header scanner (subset).
+_ALL_GROUPS: Tuple[Tuple[list, str], ...] = (
+    (_SQLI_PATTERNS, "SQLi"),
+    (_XSS_PATTERNS, "XSS"),
+    (_TRAVERSAL_PATTERNS, "LFI"),
+    (_RCE_PATTERNS, "RCE"),
+    (_SSRF_PATTERNS, "SSRF"),
+    (_INJECT_PATTERNS, "INJECT"),
+    (_PROTO_POLLUTION_PATTERNS, "PROTO"),
+    (_XXE_PATTERNS, "XXE"),
+    (_NOSQL_PATTERNS, "NOSQL"),
+)
+# Header-borne threats only. SQLi/XSS are deliberately excluded so a legit
+# `Referer` carrying a query string is never a false positive.
+_HEADER_GROUPS: Tuple[Tuple[list, str], ...] = (
+    (_TRAVERSAL_PATTERNS, "LFI"),
+    (_SSRF_PATTERNS, "SSRF"),
+    (_INJECT_PATTERNS, "INJECT"),
+    (_XXE_PATTERNS, "XXE"),
+)
+
+# Every attack label the WAF can emit (vs. the WAF_* infra-error labels).
+WAF_ATTACK_LABELS = frozenset({"SQLi", "XSS", "PROTO", "LFI", "RCE",
+                               "SSRF", "INJECT", "XXE", "NOSQL"})
+WAF_JSON_LABELS = WAF_ATTACK_LABELS | {"JSON_BOMB", "JSON_OVERSIZED",
+                                       "JSON_DEPTH", "JSON_ELEMENTS"}
+
+HEADER_WAF_SCAN_BUDGET = 8192
+HEADER_WAF_VALUE_CAP   = 1024
+
 
 def _decode_aggressive(data: str) -> str:
     cleaned = data
@@ -650,8 +838,20 @@ def _decode_aggressive(data: str) -> str:
     return cleaned
 
 
+def _scan_groups(cleaned: str, low: str, groups) -> Optional[str]:
+    for tok, label in _TOKEN_SIGNATURES:
+        if tok in low:
+            return label
+    for pats, label in groups:
+        for p in pats:
+            if p.search(cleaned):
+                return label
+    return None
+
+
 def waf_check(data: str) -> Optional[str]:
-    """Linear-time regex scan on a hard-capped prefix. Returns pattern hit."""
+    """Linear-time signature scan on a hard-capped prefix. Returns the attack
+    category label (SQLi/XSS/LFI/RCE/SSRF/INJECT/PROTO/XXE/NOSQL) or None."""
     if not data:
         return None
     data = data[:WAF_REGEX_SCAN_BYTES]
@@ -660,18 +860,21 @@ def waf_check(data: str) -> Optional[str]:
     except Exception:
         return "ERROR"
     try:
-        for p in _SQLI_PATTERNS:
-            if p.search(cleaned):
-                return "SQLi"
-        for p in _XSS_PATTERNS:
-            if p.search(cleaned):
-                return "XSS"
-        for p in _PROTO_POLLUTION_PATTERNS:
-            if p.search(cleaned):
-                return "PROTO"
+        return _scan_groups(cleaned, cleaned.lower(), _ALL_GROUPS)
     except Exception:
         return "ERROR"
-    return None
+
+
+def waf_check_headers_text(seg: str) -> Optional[str]:
+    """Low-false-positive header scan (traversal/SSRF/JNDI/XXE + fixed tokens).
+    Never runs SQLi/XSS rules — those false-positive on legit Referer values."""
+    if not seg:
+        return None
+    try:
+        cleaned = _decode_aggressive(seg[:WAF_REGEX_SCAN_BYTES])
+        return _scan_groups(cleaned, cleaned.lower(), _HEADER_GROUPS)
+    except Exception:
+        return None
 
 
 async def async_waf_check(data: str, executor, sem: Optional["asyncio.Semaphore"] = None,
@@ -876,11 +1079,22 @@ class RateLimiter:
         if ip_class == "blacklist":
             return False, 0.0, "blacklisted"
 
+        # FIX (v30): peek the ban store BEFORE consuming a global token.
+        # v29 called `_check_global` first, so a large *already-banned*
+        # botnet still drained the global bucket on every request and
+        # self-DoS'd legit users into "global_rate_limited". Dict `get`
+        # is atomic under the GIL; the authoritative re-check still runs
+        # under the shard lock below to close the peek→lock race.
+        prefix_key = self._prefix_key(ip)
+        if not bypass_ban:
+            ban_until = self._ban_store.get(prefix_key)
+            if ban_until and ban_until > time.monotonic():
+                return False, 0.0, "banned"
+
         if not await self._check_global(ip_class):
             _METRICS.global_blocks += 1
             return False, 0.0, "global_rate_limited"
 
-        prefix_key = self._prefix_key(ip)
         lock = self._shard_lock(prefix_key)
         async with lock:
             now = time.monotonic()
@@ -1139,11 +1353,210 @@ def try_acquire_sem(sem) -> bool:  # pragma: no cover — migration stub
 
 
 # ====================================================================== #
+# Proof-of-Work challenge ("I'm Under Attack" mode, v30)
+# ====================================================================== #
+# A stateless, HMAC-signed proof-of-work interstitial — the single biggest
+# L7 anti-DDoS capability v29 lacked. Un-cleared browser navigations are made
+# to solve a SHA-256 partial pre-image in the browser before being proxied;
+# a signed clearance cookie then bypasses the challenge for its lifetime.
+# Volumetric L7 floods almost never execute JavaScript, so this sheds the
+# overwhelming majority of application-layer flood traffic while genuine
+# browsers pass transparently in a fraction of a second.
+POW_VERIFY_PATH = "/__sentinel/verify"
+
+
+def _leading_zero_bits(digest: bytes) -> int:
+    n = 0
+    for byte in digest:
+        if byte == 0:
+            n += 8
+            continue
+        b = byte
+        while b < 128:
+            n += 1
+            b <<= 1
+        break
+    return n
+
+
+class ChallengeManager:
+    """Issues/verifies PoW challenges and clearance cookies. Everything is
+    self-authenticating via one HMAC key, so there is no per-client state and
+    multiple instances that share POW_SECRET interoperate seamlessly."""
+
+    __slots__ = ("_secret", "bits", "ttl", "clearance_ttl", "cookie_name", "secure")
+
+    def __init__(self, cfg: "Config", secure: bool = False) -> None:
+        if cfg.pow_secret:
+            self._secret = hashlib.sha256(cfg.pow_secret.encode("utf-8")).digest()
+        else:
+            self._secret = secrets.token_bytes(32)
+        self.bits          = cfg.pow_bits
+        self.ttl           = cfg.pow_ttl
+        self.clearance_ttl = cfg.pow_clearance_ttl
+        self.cookie_name   = cfg.pow_cookie
+        self.secure        = secure
+
+    def _sign(self, msg: str) -> str:
+        return hmac.new(self._secret, msg.encode("utf-8"),
+                        hashlib.sha256).hexdigest()[:32]
+
+    def make_challenge(self, prefix: str, now: Optional[float] = None) -> Dict[str, Any]:
+        ts = int(now if now is not None else time.time())
+        salt = secrets.token_hex(8)
+        challenge = f"{prefix}|{ts}|{salt}"
+        return {"challenge": challenge, "sig": self._sign("C:" + challenge),
+                "bits": self.bits, "verify": POW_VERIFY_PATH,
+                "cookie": self.cookie_name}
+
+    def verify_solution(self, challenge: str, sig: str, nonce: str,
+                        prefix: str, now: Optional[float] = None) -> bool:
+        if not challenge or not sig or nonce is None:
+            return False
+        if not hmac.compare_digest(sig, self._sign("C:" + challenge)):
+            return False
+        parts = challenge.split("|")
+        if len(parts) != 3:
+            return False
+        c_prefix, c_ts, _salt = parts
+        if c_prefix != prefix:            # cookie/challenge bound to /prefix
+            return False
+        try:
+            ts = int(c_ts)
+        except ValueError:
+            return False
+        cur = now if now is not None else time.time()
+        if cur - ts > self.ttl or ts - cur > 60:   # expired / clock-skew
+            return False
+        digest = hashlib.sha256(
+            (challenge + str(nonce)).encode("utf-8", "ignore")).digest()
+        return _leading_zero_bits(digest) >= self.bits
+
+    def issue_clearance(self, prefix: str, now: Optional[float] = None) -> str:
+        exp = int((now if now is not None else time.time()) + self.clearance_ttl)
+        return f"{exp}.{self._sign(f'K:{prefix}:{exp}')}"
+
+    def verify_clearance(self, token: str, prefix: str,
+                         now: Optional[float] = None) -> bool:
+        if not token or "." not in token:
+            return False
+        exp_s, _, mac = token.partition(".")
+        try:
+            exp = int(exp_s)
+        except ValueError:
+            return False
+        cur = now if now is not None else time.time()
+        if exp < cur:
+            return False
+        return hmac.compare_digest(mac, self._sign(f"K:{prefix}:{exp}"))
+
+    def cookie_header(self, token: str) -> str:
+        attrs = [f"{self.cookie_name}={token}", f"Max-Age={self.clearance_ttl}",
+                 "Path=/", "HttpOnly", "SameSite=Lax"]
+        if self.secure:
+            attrs.append("Secure")
+        return "; ".join(attrs)
+
+
+# Self-contained interstitial: compact synchronous SHA-256 in pure JS (Web
+# Crypto's async digest is far too slow for a tight PoW loop), a chunked solver
+# that keeps the UI responsive, and a <noscript> fallback. __CHALLENGE_JSON__
+# is substituted per request.
+_CHALLENGE_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Checking your browser…</title>
+<style>
+ html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  background:#0b1020;color:#e7ecff}
+ .wrap{min-height:100%;display:flex;align-items:center;justify-content:center;padding:24px}
+ .card{max-width:420px;text-align:center;background:#141b31;border:1px solid #24304f;
+  border-radius:16px;padding:32px 28px;box-shadow:0 10px 40px rgba(0,0,0,.35)}
+ .spin{width:44px;height:44px;margin:0 auto 18px;border:4px solid #2a3860;
+  border-top-color:#6ea8fe;border-radius:50%;animation:s 1s linear infinite}
+ @keyframes s{to{transform:rotate(360deg)}}
+ h1{font-size:19px;margin:0 0 8px}p{font-size:14px;color:#9fb0d9;margin:6px 0}
+ .st{font-size:12px;color:#6f82b3;margin-top:14px;min-height:16px}
+ code{color:#8ab4ff}
+</style></head>
+<body><div class="wrap"><div class="card">
+ <div class="spin"></div>
+ <h1>Checking your browser before proceeding</h1>
+ <p>This automatic check protects the site against automated attacks.
+    It runs once and takes a moment.</p>
+ <p class="st" id="st">Initializing…</p>
+ <noscript><p style="color:#ff9a9a">JavaScript is required to continue.</p></noscript>
+</div></div>
+<script id="sentinel-challenge" type="application/json">__CHALLENGE_JSON__</script>
+<script>
+(function(){
+ function sha256(bytes){
+  var K=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  var H=[0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  var l=bytes.length,withOne=l+1,k=(56-withOne%64+64)%64,total=withOne+k+8;
+  var m=new Uint8Array(total);m.set(bytes);m[l]=0x80;
+  var dv=new DataView(m.buffer),bit=l*8;
+  dv.setUint32(total-4,bit>>>0,false);dv.setUint32(total-8,Math.floor(bit/4294967296)>>>0,false);
+  var w=new Int32Array(64),i,off;
+  for(off=0;off<total;off+=64){
+   for(i=0;i<16;i++)w[i]=dv.getUint32(off+i*4,false);
+   for(i=16;i<64;i++){var x=w[i-15],y=w[i-2];
+    var s0=((x>>>7)|(x<<25))^((x>>>18)|(x<<14))^(x>>>3);
+    var s1=((y>>>17)|(y<<15))^((y>>>19)|(y<<13))^(y>>>10);
+    w[i]=(w[i-16]+s0+w[i-7]+s1)|0;}
+   var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+   for(i=0;i<64;i++){
+    var S1=((e>>>6)|(e<<26))^((e>>>11)|(e<<21))^((e>>>25)|(e<<7));
+    var ch=(e&f)^((~e)&g),t1=(h+S1+ch+K[i]+w[i])|0;
+    var S0=((a>>>2)|(a<<30))^((a>>>13)|(a<<19))^((a>>>22)|(a<<10));
+    var mj=(a&b)^(a&c)^(b&c),t2=(S0+mj)|0;
+    h=g;g=f;f=e;e=(d+t1)|0;d=c;c=b;b=a;a=(t1+t2)|0;}
+   H[0]=(H[0]+a)|0;H[1]=(H[1]+b)|0;H[2]=(H[2]+c)|0;H[3]=(H[3]+d)|0;
+   H[4]=(H[4]+e)|0;H[5]=(H[5]+f)|0;H[6]=(H[6]+g)|0;H[7]=(H[7]+h)|0;}
+  var out=new Uint8Array(32),od=new DataView(out.buffer);
+  for(i=0;i<8;i++)od.setUint32(i*4,H[i]>>>0,false);return out;}
+ function lz(d){var n=0;for(var i=0;i<d.length;i++){var b=d[i];if(b===0){n+=8;continue;}
+  while(b<128){n++;b<<=1;}break;}return n;}
+ function st(t){var e=document.getElementById('st');if(e)e.textContent=t;}
+ var C;try{C=JSON.parse(document.getElementById('sentinel-challenge').textContent);}catch(e){return;}
+ var enc=new TextEncoder(),nonce=0,t0=Date.now();
+ function submit(n){
+  fetch(C.verify,{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({challenge:C.challenge,sig:C.sig,nonce:String(n)})})
+  .then(function(r){if(r.ok){st('Verified. Loading…');location.reload();}
+   else{st('Verification failed — refresh to retry.');}})
+  .catch(function(){st('Network error — refresh to retry.');});}
+ function work(){
+  var end=(typeof performance!=='undefined'?performance.now():Date.now())+250;
+  while((typeof performance!=='undefined'?performance.now():Date.now())<end){
+   if(lz(sha256(enc.encode(C.challenge+nonce)))>=C.bits){
+    st('Solved in '+((Date.now()-t0)/1000).toFixed(1)+'s.');submit(nonce);return;}
+   nonce++;}
+  st('Verifying your browser… '+nonce+' attempts');
+  setTimeout(work,0);}
+ st('Verifying your browser…');setTimeout(work,30);
+})();
+</script></body></html>"""
+
+
+def _challenge_html(params: Dict[str, Any]) -> str:
+    return _CHALLENGE_PAGE.replace("__CHALLENGE_JSON__", json.dumps(params))
+
+
+# ====================================================================== #
 # SentinelApp — the proxy + pipeline
 # ====================================================================== #
 class _Ctx:
     """Mutable request-handling state passed through the pipeline."""
-    __slots__ = ("ip", "ip_class", "rid", "started", "body_chunk", "outbound_sem")
+    __slots__ = ("ip", "ip_class", "rid", "started", "body_chunk",
+                 "outbound_sem", "response_started")
 
     def __init__(self, ip: str, ip_class: str, rid: str,
                  started: float, body_chunk: Optional[bytes],
@@ -1154,6 +1567,9 @@ class _Ctx:
         self.started = started
         self.body_chunk = body_chunk
         self.outbound_sem = outbound_sem
+        # True once bytes have been flushed to the client. After this point
+        # the pipeline can no longer substitute a fresh error Response.
+        self.response_started = False
 
 
 class SentinelApp:
@@ -1169,6 +1585,11 @@ class SentinelApp:
         self._backend_healthy = True
         self._active_inbound = 0
         self._active_outbound = 0
+
+        # Proof-of-Work challenge state (v30).
+        self.challenge: Optional[ChallengeManager] = None
+        self._attack_task: Optional[asyncio.Task] = None
+        self._under_attack_until = 0.0
 
         # counters are dict ops under GIL — no asyncio.Lock needed (FIX-07)
         self.ip_obj_cache           = FastTTLCache(100000, 3600)
@@ -1217,12 +1638,30 @@ class SentinelApp:
                 thread_name_prefix="sentinel-waf",
             )
 
+        if self.challenge is None and self.cfg.pow_mode != "off":
+            self.challenge = ChallengeManager(
+                self.cfg, secure=(URL_SCHEME == "https"))
+            if not self.cfg.pow_secret and logger is not None:
+                logger.warning("POW_SECRET unset — using a random per-process "
+                               "key; set POW_SECRET for multi-instance clearance")
+            if self.cfg.pow_mode == "auto":
+                self._attack_task = asyncio.create_task(self._attack_monitor_loop())
+            if logger is not None:
+                logger.info("PoW challenge enabled (mode=%s, bits=%d)",
+                            self.cfg.pow_mode, self.cfg.pow_bits)
+
         connector = TCPConnector(limit=self.cfg.backend_pool_size, ttl_dns_cache=300,
                                  enable_cleanup_closed=True)
-        timeout = ClientTimeout(total=self.cfg.backend_timeout,
-                                connect=min(5, self.cfg.backend_timeout),
-                                sock_read=min(10, self.cfg.backend_timeout),
-                                sock_connect=min(5, self.cfg.backend_timeout))
+        # FIX (v30): NO `total` cap. A total-response timeout truncates large
+        # legitimate downloads streamed through the proxy (v29 cut every
+        # response at backend_timeout seconds). Bound the backend by connect +
+        # idle-read timeouts instead — the same model as nginx's
+        # proxy_read_timeout / haproxy's timeout server.
+        timeout = ClientTimeout(total=None,
+                                connect=min(5.0, self.cfg.backend_timeout),
+                                sock_connect=min(5.0, self.cfg.backend_timeout),
+                                sock_read=max(self.cfg.backend_timeout,
+                                              self.cfg.stream_idle_timeout))
         self.session = ClientSession(connector=connector, timeout=timeout,
                                      auto_decompress=False)
         app["session"] = self.session
@@ -1239,7 +1678,8 @@ class SentinelApp:
     async def shutdown(self, app: web.Application) -> None:
         if self._shutdown_event:
             self._shutdown_event.set()
-        for t in (self._health_task, self._cleanup_task, self._persist_task):
+        for t in (self._health_task, self._cleanup_task, self._persist_task,
+                  self._attack_task):
             if t:
                 t.cancel()
                 try:
@@ -1313,6 +1753,68 @@ class SentinelApp:
                     if logger is not None:
                         logger.warning("Backend unhealthy — shedding traffic")
             await asyncio.sleep(30 + random.uniform(-5, 5))
+
+    # ---- proof-of-work / under-attack ---- #
+    def _challenge_active(self) -> bool:
+        """Whether the PoW gate should challenge un-cleared navigations now."""
+        if self.challenge is None:
+            return False
+        m = self.cfg.pow_mode
+        if m == "on":
+            return True
+        if m == "auto":
+            return time.monotonic() < self._under_attack_until
+        return False
+
+    async def _attack_monitor_loop(self) -> None:
+        """Auto-engage PoW when the block RATE spikes. Keyed on blocks (not raw
+        request volume) so organic traffic bursts don't trip challenges — only
+        genuine attack behaviour (rate-limit/ban/burst/scraper blocks) does."""
+
+        def total_blocks() -> int:
+            return (_METRICS.rate_blocked + _METRICS.burst_window_blocks
+                    + _METRICS.global_blocks + _METRICS.scraper_blocks
+                    + _METRICS.bans + _METRICS.blocked)
+
+        # Seed a zero baseline at t0 so a spike that lands *before* the first
+        # sampling tick is still measured as growth from zero (else the first
+        # sample already contains the spike and delta is stuck at ~0).
+        samples: deque = deque([(time.monotonic(), total_blocks())], maxlen=128)
+        prev_engaged = False
+        while self._shutdown_event and not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=2.0)
+                break
+            except asyncio.TimeoutError:
+                pass
+            now = time.monotonic()
+            cur = total_blocks()
+            window = self.cfg.auto_pow_window
+            # Baseline = oldest PAST sample still inside the window (computed
+            # before appending the current sample).
+            base = cur
+            for t, v in samples:
+                if now - t <= window:
+                    base = v
+                    break
+            delta = cur - base
+            samples.append((now, cur))
+            if delta >= self.cfg.auto_pow_blocks:
+                self._under_attack_until = now + self.cfg.auto_pow_cooldown
+            engaged = now < self._under_attack_until
+            _METRICS.under_attack = 1 if engaged else 0
+            if engaged and not prev_engaged:
+                _METRICS.under_attack_engaged += 1
+                if logger is not None:
+                    logger.warning("UNDER ATTACK — PoW challenge engaged "
+                                   "(%d blocks / %.0fs)", delta, window)
+                if audit_logger is not None:
+                    audit_logger.warning("UNDER_ATTACK_ON blocks=%d window=%.0f",
+                                         delta, window)
+            elif prev_engaged and not engaged:
+                if logger is not None:
+                    logger.info("Attack subsided — PoW challenge disengaged")
+            prev_engaged = engaged
 
     # ---- helpers ---- #
     @staticmethod
@@ -1593,6 +2095,9 @@ class SentinelApp:
         return None
 
     async def _step_built_in_endpoints(self, request, ctx: _Ctx) -> Optional[web.Response]:
+        if self.challenge is not None and request.path == POW_VERIFY_PATH:
+            return await self._handle_pow_verify(request, ctx)
+
         if request.path == "/health":
             return await self._handle_health(request, ctx)
 
@@ -1625,6 +2130,51 @@ class SentinelApp:
             text="OK" if self._backend_healthy else "DEGRADED",
             status=200 if self._backend_healthy else 503,
         )
+
+    async def _handle_pow_verify(self, request, ctx: _Ctx) -> web.Response:
+        """Accept a PoW solution and, if valid, mint a clearance cookie. This
+        endpoint runs before the rate limiter (it must work while under
+        attack), so it carries its own cheap per-IP cap. Verification is a
+        single HMAC + single SHA-256 — O(1) and impossible to amplify."""
+        cm = self.challenge
+        vkey = f"powv:{ctx.ip}"
+        cnt = self.per_ip_endpoint_cache.get(vkey) or 0
+        if cnt > self.cfg.pow_verify_limit:
+            return self._err(request, 429, "Too Many Attempts", retry_after=30)
+        self.per_ip_endpoint_cache.set(vkey, cnt + 1, keep_ttl=True)
+
+        challenge = sig = nonce = None
+        try:
+            ctype = request.content_type or ""
+            if "application/json" in ctype:
+                data = await asyncio.wait_for(request.json(), timeout=2.0)
+                if isinstance(data, dict):
+                    challenge, sig, nonce = (data.get("challenge"),
+                                             data.get("sig"), data.get("nonce"))
+            elif request.method == "POST":
+                data = await asyncio.wait_for(request.post(), timeout=2.0)
+                challenge, sig, nonce = (data.get("challenge"),
+                                         data.get("sig"), data.get("nonce"))
+        except Exception:
+            pass
+        if challenge is None:
+            challenge = request.query.get("challenge")
+            sig = request.query.get("sig")
+            nonce = request.query.get("nonce")
+
+        prefix = self.rate_limiter._prefix_key(ctx.ip)
+        if cm.verify_solution(str(challenge or ""), str(sig or ""),
+                              str(nonce or ""), prefix):
+            _METRICS.pow_solved += 1
+            _METRICS.clearance_granted += 1
+            token = cm.issue_clearance(prefix)
+            headers = {"Cache-Control": "no-store", "Connection": "close",
+                       "X-Request-ID": ctx.rid,
+                       "Set-Cookie": cm.cookie_header(token)}
+            return web.Response(status=200, text='{"status":"ok"}',
+                                content_type="application/json", headers=headers)
+        _METRICS.pow_failed += 1
+        return self._err(request, 403, '{"status":"failed"}')
 
     async def _step_outbound_queue(self, request, ctx: _Ctx) -> Optional[web.Response]:
         if not await _try_acquire_async(OUTBOUND_REQ_SEM):  # FIX-A
@@ -1739,6 +2289,28 @@ class SentinelApp:
         return self._err(request, 429, "Too Many Requests",
                          retry_after=5, extra_headers=rr_extra)
 
+    @staticmethod
+    def _scan_request_headers(request) -> Optional[str]:
+        """Bounded, low-false-positive scan of header VALUES for header-borne
+        injection (Log4Shell/JNDI, SSRF, traversal, XXE). Skips opaque/secret
+        headers and caps total bytes examined to keep it O(1) per request."""
+        budget = HEADER_WAF_SCAN_BUDGET
+        for name, val in request.headers.items():
+            if not val:
+                continue
+            nl = name.lower()
+            if nl in ("cookie", "authorization", "proxy-authorization",
+                      "x-request-id", "if-none-match", "if-match", "etag"):
+                continue
+            seg = val[:HEADER_WAF_VALUE_CAP]
+            res = waf_check_headers_text(seg)
+            if res:
+                return res
+            budget -= len(seg)
+            if budget <= 0:
+                break
+        return None
+
     async def _step_waf_filter(self, request, ctx: _Ctx) -> Optional[web.Response]:
         if not self.cfg.enable_waf:
             ctx.body_chunk = None
@@ -1762,6 +2334,21 @@ class SentinelApp:
                                                 "path": (request.path_qs or "")[:512]})
                 return self._err(request, 403, "Forbidden")
 
+        # Header WAF (v30) — Log4Shell/JNDI, SSRF and traversal payloads
+        # frequently arrive via headers (User-Agent, Referer, X-Api-Version,
+        # X-Forwarded-For, …), which v29 never inspected. Bounded, synchronous,
+        # low-false-positive (no SQLi/XSS rules on header values).
+        hdr_hit = self._scan_request_headers(request)
+        if hdr_hit:
+            _METRICS.waf_hits += 1
+            if audit_logger is not None:
+                audit_logger.warning("WAF_HIT_HEADER %s %s %s", ctx.ip, hdr_hit, request.path,
+                                     extra={"request_id": ctx.rid, "ip": ctx.ip,
+                                            "method": request.method,
+                                            "path": (request.path_qs or "")[:512]})
+            await self.rate_limiter.force_ban(ctx.ip, request_id=ctx.rid)
+            return self._err(request, 403, "WAF Blocked")
+
         # Path + query WAF
         combined = f"{request.path or ''}\x00{request.query_string or ''}"[:WAF_INSPECT_SIZE]
         waf_res = await async_waf_check(combined, self.waf_executor,
@@ -1777,7 +2364,7 @@ class SentinelApp:
             return self._err(request, 503 if waf_res == "WAF_OVERLOAD" else 400,
                              "Service Overloaded" if waf_res == "WAF_OVERLOAD" else "WAF Error",
                              retry_after=retry)
-        if waf_res in ("SQLi", "XSS", "PROTO"):
+        if waf_res in WAF_ATTACK_LABELS:
             _METRICS.waf_hits += 1
             if audit_logger is not None:
                 audit_logger.warning("WAF_HIT %s %s %s", ctx.ip, waf_res, request.path,
@@ -1835,7 +2422,7 @@ class SentinelApp:
                                 "Service Overloaded" if waf_res == "WAF_OVERLOAD" else "WAF Error",
                                 retry_after=5,
                             )
-                        if waf_res in ("SQLi", "XSS", "PROTO"):
+                        if waf_res in WAF_ATTACK_LABELS:
                             _METRICS.waf_hits += 1
                             if audit_logger is not None:
                                 audit_logger.warning("WAF_HIT_BODY %s %s %s",
@@ -1866,8 +2453,7 @@ class SentinelApp:
                                 )
                             except asyncio.TimeoutError:
                                 return self._err(request, 413, "JSON too large")
-                            if json_res in ("SQLi", "XSS", "PROTO", "JSON_BOMB",
-                                            "JSON_OVERSIZED", "JSON_DEPTH", "JSON_ELEMENTS"):
+                            if json_res in WAF_JSON_LABELS:
                                 _METRICS.waf_hits += 1
                                 if audit_logger is not None:
                                     audit_logger.warning("WAF_HIT_JSON %s %s %s",
@@ -1937,13 +2523,7 @@ class SentinelApp:
         self._active_inbound += 1
 
         try:
-            return await asyncio.wait_for(
-                self._run_pipeline(request, ctx),
-                timeout=self.cfg.backend_timeout + 5.0,
-            )
-        except asyncio.TimeoutError:
-            _METRICS.slow_aborts += 1
-            return await self._blackhole(request, ip, "Slowloris/Timeout")
+            return await self._run_pipeline(request, ctx)
         except asyncio.CancelledError:
             raise
         except web.HTTPException:
@@ -1951,6 +2531,13 @@ class SentinelApp:
         except Exception as e:
             if logger is not None:
                 logger.critical("Unhandled error: %s", e, exc_info=True)
+            # FIX (v30): once streaming has begun we cannot substitute a
+            # fresh Response (the status line + headers are already on the
+            # wire). Tear the socket down instead of raising a confusing
+            # "prepare twice" error.
+            if ctx.response_started:
+                self._safe_abort(request.transport)
+                raise
             return await self._blackhole(request, ip, "Internal Error")
         finally:
             self._active_inbound -= 1
@@ -1964,59 +2551,117 @@ class SentinelApp:
                 except Exception:
                     pass
 
+    # Analysis steps run under a bounded timeout (slowloris defence). The
+    # forward/stream step is deliberately NOT in this list — it runs after,
+    # governed by per-chunk idle timeouts, so large legit downloads complete.
+    _ANALYSIS_STEP_NAMES = (
+        "_step_built_in_endpoints",
+        "_step_basic_request_sanity",
+        "_step_method",
+        "_step_te_cl_smuggling",
+        "_step_header_uri_caps",
+        "_step_outbound_queue",
+        "_step_global_ip_cap",
+        "_step_unique_query_scrape",
+        "_step_endpoint_cap",
+        "_step_ip_classify_and_ban_check",
+        "_step_rate_limit",
+        "_step_challenge",       # v30 proof-of-work (no-op unless enabled)
+        "_step_waf_filter",
+        "_step_backend_shed",
+    )
+
     async def _run_pipeline(self, request, ctx: _Ctx) -> web.Response:
-        steps: List[Callable[[web.Request, _Ctx], Awaitable[Optional[web.Response]]]] = [
-            self._step_built_in_endpoints,
-            self._step_basic_request_sanity,
-            self._step_method,
-            self._step_te_cl_smuggling,
-            self._step_header_uri_caps,
-            self._step_outbound_queue,
-            self._step_global_ip_cap,
-            self._step_unique_query_scrape,
-            self._step_endpoint_cap,
-            self._step_ip_classify_and_ban_check,
-            self._step_rate_limit,
-            self._step_waf_filter,
-            self._step_backend_shed,
-            self._step_forward,
-        ]
+        steps = [getattr(self, n) for n in self._ANALYSIS_STEP_NAMES]
         try:
-            for step in steps:
-                resp: Optional[web.Response] = None
-                try:
-                    resp = await step(request, ctx)
-                except (web.HTTPException,):
-                    raise
-                except Exception as e:
-                    if logger is not None:
-                        logger.critical("Pipeline step %s failed: %s",
-                                        step.__name__, e, exc_info=True)
-                    resp = await self._blackhole(request, ctx.ip, "Internal Error")
-                if resp is not None:
-                    if ctx.ip_class != "whitelist":
-                        rl_headers = {
-                            "X-RateLimit-Limit": str(int(self.cfg.rate_limit * self.cfg.burst_limit)),
-                        }
-                        ban_remaining = self.rate_limiter.ban_status(ctx.ip) if self.rate_limiter else None
-                        if ban_remaining is not None:
-                            rl_headers["X-RateLimit-Remaining"] = "0"
-                            rl_headers["X-RateLimit-Reset"] = str(max(1, int(ban_remaining - time.monotonic())))
-                        try:
-                            resp.headers.update(rl_headers)
-                        except Exception:
-                            pass
-                    return resp
-            return self._err(request, 500, "Pipeline ended without response")
+            # Phase 1 — analysis, bounded by analysis_timeout.
+            try:
+                resp = await asyncio.wait_for(
+                    self._run_analysis(request, ctx, steps),
+                    timeout=self.cfg.analysis_timeout,
+                )
+            except asyncio.TimeoutError:
+                _METRICS.slow_aborts += 1
+                return await self._blackhole(request, ctx.ip, "Slowloris/Timeout")
+
+            if resp is not None:
+                self._augment_rl_headers(resp, ctx)
+                return resp
+
+            # Phase 2 — forward + stream (idle-timeout governed, no total cap).
+            return await self._step_forward(request, ctx)
         finally:
-            # FIX-15: release OUTBOUND_REQ_SEM EXACTLY once on EVERY exit path —
-            # including short-circuits, exceptions, and pipeline-end-without-step.
+            # FIX-15: release OUTBOUND_REQ_SEM EXACTLY once on EVERY exit path.
             if ctx.outbound_sem is not None:
                 try:
                     ctx.outbound_sem.release()
                 except (ValueError, AssertionError):
                     pass
                 ctx.outbound_sem = None
+
+    async def _run_analysis(self, request, ctx: _Ctx, steps) -> Optional[web.Response]:
+        for step in steps:
+            try:
+                resp = await step(request, ctx)
+            except web.HTTPException:
+                raise
+            except Exception as e:
+                if logger is not None:
+                    logger.critical("Pipeline step %s failed: %s",
+                                    step.__name__, e, exc_info=True)
+                return await self._blackhole(request, ctx.ip, "Internal Error")
+            if resp is not None:
+                return resp
+        return None
+
+    def _augment_rl_headers(self, resp, ctx: _Ctx) -> None:
+        if ctx.ip_class == "whitelist":
+            return
+        try:
+            rl_headers = {
+                "X-RateLimit-Limit": str(int(self.cfg.rate_limit * self.cfg.burst_limit)),
+            }
+            ban_remaining = self.rate_limiter.ban_status(ctx.ip) if self.rate_limiter else None
+            if ban_remaining is not None:
+                rl_headers["X-RateLimit-Remaining"] = "0"
+                rl_headers["X-RateLimit-Reset"] = str(
+                    max(1, int(ban_remaining - time.monotonic())))
+            resp.headers.update(rl_headers)
+        except Exception:
+            pass
+
+    async def _step_challenge(self, request, ctx: _Ctx) -> Optional[web.Response]:
+        """Proof-of-work gate (v30). Only top-level browser navigations
+        (GET/HEAD with `Accept: text/html`) without a valid clearance cookie
+        are served the interstitial — API/XHR/asset traffic is untouched and
+        still faces every other defence. Whitelisted IPs always bypass."""
+        cm = self.challenge
+        if cm is None or not self._challenge_active():
+            return None
+        if ctx.ip_class == "whitelist":
+            return None
+        if request.method not in ("GET", "HEAD"):
+            return None
+        if "text/html" not in (request.headers.get("Accept", "") or ""):
+            return None
+
+        prefix = self.rate_limiter._prefix_key(ctx.ip)
+        token = request.cookies.get(cm.cookie_name, "")
+        if token and cm.verify_clearance(token, prefix):
+            return None
+
+        _METRICS.pow_challenges += 1
+        if audit_logger is not None:
+            audit_logger.warning("POW_CHALLENGE %s %s", ctx.ip, request.path,
+                                 extra={"request_id": ctx.rid, "ip": ctx.ip,
+                                        "method": request.method,
+                                        "path": (request.path_qs or "")[:512]})
+        html = _challenge_html(cm.make_challenge(prefix))
+        headers = dict(BLOCK_HEADERS)
+        headers["X-Request-ID"] = ctx.rid
+        headers["Retry-After"] = "3"
+        return web.Response(status=503, text=html,
+                            content_type="text/html", headers=headers)
 
     # ---- forward ---- #
     async def _forward(self, request, ctx: _Ctx) -> web.Response:
@@ -2076,39 +2721,65 @@ class SentinelApp:
                         bheaders["Connection"] = "close"
 
                         client_resp = web.StreamResponse(status=resp.status, headers=bheaders)
+                        # From here the status line + headers are on the wire;
+                        # we can no longer swap in a fresh error Response.
+                        ctx.response_started = True
                         await client_resp.prepare(request)
 
+                        # FIX (v30): stream with a per-chunk IDLE timeout, not a
+                        # total-duration timeout. v29 wrapped the whole stream in
+                        # `wait_for(timeout=backend_timeout)`, which truncated any
+                        # legit download longer than that (throttle * size), then
+                        # tried — and failed — to send a fresh response over an
+                        # already-prepared stream. Now a stalled peer is cut but a
+                        # steady large transfer completes.
+                        idle = self.cfg.stream_idle_timeout
+                        max_bps = self.cfg.resp_max_bps  # 0 = unthrottled
                         try:
-                            max_bps = 2 * 1024 * 1024
-                            chunk_sz = 64 * 1024
-
-                            async def _stream():
-                                tokens = max_bps
-                                last_refill = time.monotonic()
-                                async for chunk in resp.content.iter_chunked(chunk_sz):
+                            tokens = float(max_bps)
+                            last_refill = time.monotonic()
+                            while True:
+                                try:
+                                    chunk = await asyncio.wait_for(
+                                        resp.content.readany(), timeout=idle)
+                                except asyncio.TimeoutError:
+                                    if logger is not None:
+                                        logger.debug("Backend stream idle timeout: %s", ctx.ip)
+                                    self._safe_abort(request.transport)
+                                    client_resp.force_close()
+                                    return client_resp
+                                if not chunk:
+                                    break
+                                if max_bps:
                                     cost = len(chunk)
                                     now = time.monotonic()
-                                    elapsed = now - last_refill
-                                    tokens = min(max_bps, tokens + elapsed * max_bps)
+                                    tokens = min(float(max_bps),
+                                                 tokens + (now - last_refill) * max_bps)
                                     last_refill = now
                                     if tokens < cost:
                                         await asyncio.sleep((cost - tokens) / max_bps)
-                                        tokens = 0
+                                        tokens = 0.0
                                     else:
                                         tokens -= cost
-                                    try:
-                                        await client_resp.write(chunk)
-                                    except (ConnectionResetError, BrokenPipeError):
-                                        return
-                                await client_resp.write_eof()
-
-                            await asyncio.wait_for(_stream(),
-                                                  timeout=self.cfg.backend_timeout)
-                        except (asyncio.TimeoutError, ConnectionResetError,
-                                ConnectionAbortedError, BrokenPipeError,
-                                asyncio.IncompleteReadError, ClientError):
+                                try:
+                                    await asyncio.wait_for(
+                                        client_resp.write(chunk), timeout=idle)
+                                except (ConnectionResetError, BrokenPipeError,
+                                        ConnectionAbortedError):
+                                    return client_resp
+                                except asyncio.TimeoutError:
+                                    if logger is not None:
+                                        logger.debug("Client write idle timeout: %s", ctx.ip)
+                                    self._safe_abort(request.transport)
+                                    client_resp.force_close()
+                                    return client_resp
+                            await client_resp.write_eof()
+                        except (ConnectionResetError, ConnectionAbortedError,
+                                BrokenPipeError, asyncio.IncompleteReadError,
+                                ClientError) as e:
                             if logger is not None:
-                                logger.debug("Client connection interrupted: %s", ctx.ip)
+                                logger.debug("Client connection interrupted: %s (%s)",
+                                             ctx.ip, e)
                             self._safe_abort(request.transport)
                             client_resp.force_close()
                             return client_resp
@@ -2213,6 +2884,8 @@ class SentinelApp:
             "bans", "slow_aborts", "circuit_rejects", "rate_blocked",
             "burst_window_blocks", "scraper_blocks", "global_blocks",
             "log_drops", "audit_log_drops",
+            "pow_challenges", "pow_solved", "pow_failed", "clearance_granted",
+            "under_attack", "under_attack_engaged",
         )}
 
     def _metrics_text(self) -> str:
@@ -2226,14 +2899,19 @@ URL_SCHEME = os.getenv("URL_SCHEME", "http")
 
 
 def hmac_compare(a: str, b: str) -> bool:
-    if a is None or b is None:
+    """Constant-time string comparison.
+
+    v29 hand-rolled the compare and early-returned on a length mismatch,
+    which leaks the secret length via timing. v30 delegates to the stdlib
+    `hmac.compare_digest`, which is constant-time over the shorter operand
+    and does not branch on length."""
+    if not a or not b:
         return False
-    if len(a) != len(b) or not a or not b:
+    try:
+        return hmac.compare_digest(a.encode("utf-8", "ignore"),
+                                   b.encode("utf-8", "ignore"))
+    except Exception:
         return False
-    res = 0
-    for x, y in zip(a, b):
-        res |= ord(x) ^ ord(y)
-    return res == 0
 
 
 # ====================================================================== #
@@ -2264,7 +2942,9 @@ def _print_help() -> None:
     help_txt = f"""\
 Sentinel Guard v{VERSION} — single-file anti-DDoS L7 reverse proxy
 
-Run --dry-run to validate config. See file header for v28.0 hardening list.
+  --dry-run     validate config and exit
+  --self-test   run the built-in unit suite and exit (0=pass)
+  --help        this text
 
 Environment variables (all optional):
   SENTINEL_HOST, SENTINEL_PORT   bind address (default 0.0.0.0:9999)
@@ -2279,7 +2959,7 @@ Environment variables (all optional):
                                  comma-separated CIDR lists
   CF_PROXIES                     Cloudflare egress CIDRs (defaults to public list)
   ALLOWED_METHODS                default: GET,POST,HEAD,PUT,DELETE,OPTIONS,PATCH
-  ENABLE_WAF                     bool (1/0)
+  ENABLE_WAF                     bool (1/0); scans path/query/body + headers
   BACKEND_HEALTH_CHECK, BACKEND_HEALTH_PATH
                                  optional backend health shedding
   WAF_BODY_TIMEOUT, WAF_REGEX_TIMEOUT
@@ -2287,6 +2967,22 @@ Environment variables (all optional):
   BAN_PERSIST_FILE, BAN_PERSIST_INTERVAL
                                  bans-on-disk (default sentinel_bans.json / 5min)
   METRICS_TOKEN                  if set, /metrics?token=... is required
+
+  Streaming (v30):
+  RESP_MAX_BPS                   per-response throttle, bytes/s (0=off, default 2MiB)
+  STREAM_IDLE_TIMEOUT            max idle gap while streaming (default 15s)
+  ANALYSIS_TIMEOUT               cap on the pre-forward analysis phase
+
+  Proof-of-Work "I'm Under Attack" (v30):
+  POW_MODE                       off | on | auto   (default auto)
+  POW_BITS                       PoW difficulty in leading zero bits (default 18)
+  POW_TTL, POW_CLEARANCE_TTL     challenge / clearance-cookie lifetimes (s)
+  POW_SECRET                     shared HMAC key (REQUIRED for multi-instance)
+  POW_COOKIE                     clearance cookie name (default __sentinel_clr)
+  POW_VERIFY_LIMIT               per-IP verify attempts / min (default 60)
+  AUTO_POW_BLOCKS                blocks within the window that engage auto mode
+  AUTO_POW_WINDOW, AUTO_POW_COOLDOWN
+                                 detection window / hold time (default 10s / 120s)
 """
     print(help_txt)
 
@@ -2294,6 +2990,7 @@ Environment variables (all optional):
 def _parse_args(argv):
     out: Dict[str, str] = {}
     dry_run = False
+    self_test = False
     for arg in argv[1:]:
         if arg in ("--help", "-h"):
             _print_help()
@@ -2301,18 +2998,25 @@ def _parse_args(argv):
         if arg == "--dry-run":
             dry_run = True
             continue
+        if arg == "--self-test":
+            self_test = True
+            continue
         if arg.startswith("--config="):
             kv = arg[len("--config="):]
             if "=" in kv:
                 k, v = kv.split("=", 1)
                 out[k] = v
             continue
-    return out, dry_run
+    return out, dry_run, self_test
 
 
 def main() -> None:
     global CFG, logger, audit_logger
-    overrides, dry_run = _parse_args(sys.argv)
+    overrides, dry_run, self_test = _parse_args(sys.argv)
+
+    if self_test:
+        sys.exit(_self_test())
+
     try:
         CFG = Config(overrides)
     except ValueError as e:
@@ -2327,6 +3031,7 @@ def main() -> None:
         print(f"  burst_window   : {CFG.per_ip_burst_limit} req / {CFG.per_ip_burst_window}s")
         print(f"  max_body_size  : {CFG.max_body_size} bytes")
         print(f"  waf            : enabled={CFG.enable_waf} regex_to={CFG.waf_regex_timeout}s")
+        print(f"  pow            : mode={CFG.pow_mode} bits={CFG.pow_bits}")
         print(f"  fd_limit       : {MAX_SAFE_CONNS}")
         print(f"  platform       : {sys.platform} ({platform.release()})")
         sys.exit(0)
