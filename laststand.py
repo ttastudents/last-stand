@@ -45,7 +45,7 @@ from collections import deque
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 9999
 UPSTREAM_HOST = "127.0.0.1"
-UPSTREAM_PORT = 8888
+UPSTREAM_PORT = 80
 
 # A global admission cap is a resource/backpressure guard, not an IP allowlist
 # or a request-rate limiter.  Every source address is treated identically.
